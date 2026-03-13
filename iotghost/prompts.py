@@ -300,23 +300,33 @@ Do NOT restart from scratch -- fix incrementally.
 FIX_PROMPT = """\
 ## CURRENT PHASE: ERROR RECOVERY
 
-The emulation encountered an error. Analyze and fix it.
+The emulation encountered an error. A structured diagnosis has been performed.
 
-Error output:
+### Diagnosis Summary
+{diagnosis_summary}
+
+### Root Cause
+{root_cause}
+
+### Recommended Fix
+{recommended_fix}
+
+### Raw Evidence from Serial Log
 {error_output}
 
-Previous attempts:
+### Previous Fix Attempts
 {previous_fixes}
 
 DIAGNOSTIC APPROACH:
-1. Read the error message CAREFULLY -- the answer is usually in it
-2. Classify the error:
+1. Read the diagnosis above CAREFULLY -- it already identified the likely root cause
+2. Follow the recommended fix FIRST before trying alternatives
+3. If the recommended fix does not apply, classify the error yourself:
    - Kernel panic -> wrong kernel, missing rootfs support, bad root= param
    - Segfault -> missing lib, NVRAM issue, arch mismatch
    - Service crash -> missing config, device node, permission issue
    - Network failure -> interface not configured, wrong IP, bridge issue
-3. Apply the MINIMAL fix -- don't change things that were working
-4. If same fix was tried before, try a fundamentally different approach
+4. Apply the MINIMAL fix -- don't change things that were working
+5. If same fix was tried before (see previous attempts), try a fundamentally different approach
 
 COMMON FIX PATTERNS:
 - "not found" -> missing binary or library, check paths and symlinks
@@ -732,3 +742,287 @@ mknod /path/to/rootfs/dev/urandom c 1 9
 - If it requires kernel modules that can't be loaded -- note it and move on
 - Focus on httpd/web server binaries -- those are the primary targets
 """
+
+
+NVRAM_RECOVERY_PROMPT = """\
+## NVRAM EMULATION RECOVERY
+
+The firmware is crashing because NVRAM emulation is broken. This is the #1 cause
+of IoT firmware emulation failures (~53% of cases).
+
+### Current State
+- Rootfs: {rootfs_path}
+- Architecture: {arch}
+- Detected Vendor: {vendor}
+
+### Step-by-Step NVRAM Recovery
+
+1. **Verify libnvram.so exists and matches rootfs architecture**:
+   ```
+   file {rootfs_path}/usr/lib/libnvram.so
+   readelf -h {rootfs_path}/usr/lib/libnvram.so | grep Machine
+   file {rootfs_path}/bin/busybox | head -1
+   ```
+   Both MUST show the same architecture (ARM/MIPS/etc). If mismatched,
+   you need to cross-compile libnvram.so for the correct arch.
+
+2. **Verify LD_PRELOAD is set correctly in init scripts**:
+   ```
+   grep -r "LD_PRELOAD" {rootfs_path}/etc/
+   grep -r "libnvram" {rootfs_path}/etc/init.d/
+   cat {rootfs_path}/etc/profile
+   ```
+   LD_PRELOAD must use an ABSOLUTE path inside the chroot (e.g., /usr/lib/libnvram.so).
+   If not set in init, add it:
+   ```
+   echo 'export LD_PRELOAD=/usr/lib/libnvram.so' >> {rootfs_path}/etc/profile
+   ```
+   Also patch rcS or inittab to export it before starting services.
+
+3. **Verify nvram.ini has required keys for the vendor**:
+   ```
+   cat {rootfs_path}/etc/nvram.ini
+   ```
+   Must contain at minimum: lan_ipaddr, lan_netmask, http_lanport, http_enable.
+   For {vendor} firmware, also check vendor-specific keys.
+
+4. **Test NVRAM isolation (isolate NVRAM from boot issues)**:
+   ```
+   chroot {rootfs_path} /usr/bin/qemu-{arch}-static \\
+     -E LD_PRELOAD=/usr/lib/libnvram.so /bin/sh -c "ls /tmp/nvram"
+   ```
+   If this segfaults, libnvram.so itself is broken or wrong arch.
+   If this works, the NVRAM layer is OK and the problem is elsewhere.
+
+5. **Test the main service binary directly**:
+   ```
+   chroot {rootfs_path} /usr/bin/qemu-{arch}-static \\
+     -E LD_PRELOAD=/usr/lib/libnvram.so /usr/sbin/httpd -h
+   ```
+   Watch for: missing libraries, missing config files, or immediate crashes.
+
+### Common NVRAM Pitfalls
+- libnvram.so compiled for host (x86) but rootfs is ARM/MIPS
+- LD_PRELOAD path relative instead of absolute
+- nvram.ini missing critical keys that cause NULL pointer deref in httpd
+- /dev/nvram device node missing (some firmware checks this)
+- Multiple libnvram.so copies in different dirs -- wrong one loaded
+"""
+
+
+QEMU_BOOT_FIX_PROMPT = """\
+## QEMU BOOT DIAGNOSIS & FIX
+
+QEMU failed to boot the firmware. Use this structured approach to identify and fix the issue.
+
+### Diagnosis from Serial Log Analysis
+{diagnosis}
+
+### Evidence
+{serial_evidence}
+
+### Recommended Fix
+{recommended_fix}
+
+### Systematic Boot Fix Procedure
+
+1. **Test with minimal init (isolate kernel from userspace)**:
+   Modify the kernel append line to use init=/bin/sh:
+   ```
+   # Original: -append "root=/dev/sda1 console=ttyS0 rw rootwait"
+   # Test:     -append "root=/dev/sda1 console=ttyS0 rw rootwait init=/bin/sh"
+   ```
+   If this boots to a shell -> kernel+rootfs are OK, problem is in init/services.
+   If this still panics -> problem is kernel, rootfs image, or QEMU config.
+
+2. **Verify kernel supports the rootfs filesystem type**:
+   ```
+   file <rootfs_image>
+   ```
+   If rootfs is ext4, kernel must have CONFIG_EXT4_FS=y.
+   If rootfs is squashfs, kernel must have CONFIG_SQUASHFS=y.
+   Pre-built kernels usually support ext4. If your rootfs is squashfs,
+   either repack as ext4 or build a kernel with squashfs support.
+
+3. **Verify rootfs block device path matches kernel append**:
+   - Malta MIPS: root device is usually /dev/sda1 (IDE/PIIX)
+   - ARM virt: root device is usually /dev/vda (virtio-blk)
+   - ARM versatilepb: root device is /dev/sda (sym53c8xx SCSI)
+   Try different root= values if boot says "unable to mount root fs".
+
+4. **Try different machine types if QEMU crashes**:
+   - MIPS: -M malta (standard), ensure -cpu 74Kf for FPU
+   - ARM 32-bit: -M virt (modern), -M versatilepb (legacy), -M realview-pb-a8
+   - ARM64: -M virt
+   - x86: -M pc, -M q35
+
+5. **Check for kernel/rootfs arch mismatch**:
+   ```
+   file <kernel_path>
+   file <rootfs_path>/bin/busybox
+   ```
+   Both must show same architecture. A MIPS kernel cannot boot ARM rootfs.
+
+6. **If all else fails -- build a custom kernel**:
+   The pre-built kernel may lack required drivers or modules.
+   Use Buildroot to compile a kernel specifically for this firmware's needs.
+"""
+
+
+VENDOR_RECOVERY_PROMPTS: dict[str, str] = {
+    "tenda": """\
+## TENDA-SPECIFIC RECOVERY
+
+Tenda routers (AC15, AC18, AC9, F9, etc.) are ARM Broadcom BCM4708/4709 based.
+They have specific emulation requirements:
+
+### Known Tenda Issues
+1. **Heavy NVRAM dependency**: httpd calls nvram_get() for almost every config value.
+   Missing ANY key causes segfault. Critical Tenda NVRAM keys:
+   - lan_ipaddr=192.168.0.1, lan_netmask=255.255.255.0
+   - http_lanport=80, http_enable=1
+   - sys.workmode=route, sys.wan.type=dhcp
+   - wl_mode=ap, wl_ssid=Tenda_AC15
+   - scheduleEnable=0, firewall_enable=0
+   - igmp_enable=0, upnp_enable=0
+   - config_index=0, config_size=0
+
+2. **Custom /dev/mtdblock layout**: Tenda expects 6-8 MTD partitions:
+   ```
+   mknod /dev/mtdblock0 b 31 0  # bootloader
+   mknod /dev/mtdblock1 b 31 1  # kernel
+   mknod /dev/mtdblock2 b 31 2  # rootfs
+   mknod /dev/mtdblock3 b 31 3  # overlay/config
+   mknod /dev/mtdblock4 b 31 4  # nvram
+   mknod /dev/mtdblock5 b 31 5  # boarddata
+   ```
+
+3. **GPIO device nodes**: Some Tenda services check for GPIO:
+   ```
+   mkdir -p /dev/gpio
+   mknod /dev/gpio/in c 127 0
+   mknod /dev/gpio/out c 127 1
+   mknod /dev/gpio/ioctl c 127 2
+   ```
+
+4. **cfm/tdcore daemon**: Tenda uses a proprietary config manager (cfm or tdcore)
+   that must start before httpd. Check:
+   ```
+   ls -la <rootfs>/usr/sbin/cfm <rootfs>/usr/sbin/tdcore
+   ```
+   These also need NVRAM and may need /dev/mtdblock3 for persistent storage.
+
+5. **ARM machine type**: Use -M virt with -cpu cortex-a15 for BCM4708.
+   The kernel MUST have virtio drivers. If using versatilepb, switch to
+   -device virtio-net-device for networking.
+
+### Fix Order for Tenda
+1. Deploy libnvram.so (ARM, matching rootfs arch)
+2. Populate ALL Tenda NVRAM keys above in nvram.ini
+3. Create /dev/mtdblock0-5 device nodes
+4. Create /dev/gpio nodes
+5. Ensure LD_PRELOAD is exported in /etc/init.d/rcS
+6. Start cfm/tdcore before httpd in init sequence
+""",
+
+    "dlink": """\
+## D-LINK SPECIFIC RECOVERY
+
+D-Link routers (DIR-series) typically use MIPS Broadcom or Realtek SoCs.
+
+### Known D-Link Issues
+1. **HNAP protocol**: D-Link uses HNAP for management alongside HTTP.
+   httpd may crash if HNAP config is missing.
+2. **mydlink cloud**: Newer firmware tries to connect to mydlink servers.
+   Disable by setting: cloud_enable=0 in NVRAM.
+3. **Device identity**: Must set: device_name, model_name, hardware_version,
+   firmware_version in NVRAM or services crash.
+4. **MTD layout**: Usually needs /dev/mtdblock0-4.
+5. **NVRAM critical keys**: httpd_enable=1, admin_user=admin, admin_passwd=(empty),
+   lan_ipaddr=192.168.0.1, http_lanport=80.
+""",
+
+    "tplink": """\
+## TP-LINK SPECIFIC RECOVERY
+
+TP-Link routers often use MIPS (Atheros/Qualcomm) or ARM (newer models).
+
+### Known TP-Link Issues
+1. **Proprietary config system**: TP-Link uses a binary config partition
+   instead of standard NVRAM. Look for /dev/mtdblock4 or /dev/caldata.
+2. **httpd requires /tmp/TMP_FILE**: Many TP-Link httpd binaries expect
+   specific temp files. Create: mkdir -p /tmp && touch /tmp/TMP_FILE
+3. **admin credentials**: Default admin_name=admin, admin_pwd=admin.
+   These must be in config or httpd rejects all logins.
+4. **Dual-image layout**: Some TP-Link firmware has two rootfs partitions.
+   Make sure you extracted the active one (check /proc/cmdline expectations).
+""",
+
+    "netgear": """\
+## NETGEAR SPECIFIC RECOVERY
+
+Netgear routers (R-series, Nighthawk) use Broadcom ARM or MIPS.
+
+### Known Netgear Issues
+1. **Heavy NVRAM dependency**: Similar to Tenda, Netgear httpd is very
+   NVRAM-dependent. Critical keys: http_username=admin, http_passwd=password,
+   friendly_name=NETGEAR Router, upnp_enable=1.
+2. **ReadyShare USB**: Some services expect USB subsystem. Stub out
+   /dev/sd* and /proc/scsi if needed.
+3. **Detcable/WAN detection**: Netgear httpd checks WAN cable status.
+   Set wan_proto=dhcp, wan_ipaddr=0.0.0.0 in NVRAM.
+4. **Circle parental controls**: Disable circle_enable=0 to avoid
+   crash from missing Circle daemon.
+""",
+
+    "asus": """\
+## ASUS SPECIFIC RECOVERY
+
+ASUS routers (RT-AC series) use Broadcom ARM (BCM4708/4709).
+
+### Known ASUS Issues
+1. **ASUSWRT/Merlin**: Complex init system with many interdependent services.
+   Start order matters: nvram -> wanduck -> httpd -> dnsmasq.
+2. **NVRAM partition**: ASUS stores NVRAM in a dedicated MTD partition.
+   Must create /dev/mtdblock with correct layout.
+3. **Web UI**: httpd expects /www/ with all .asp pages. If missing,
+   check if www is a separate squashfs.
+4. **productid and firmver**: Must be set in NVRAM or httpd shows
+   "firmware corrupted" page.
+5. **Wireless driver stubs**: wl module is Broadcom proprietary.
+   Stub out /lib/modules/wl.ko or disable wl_radio=0 in NVRAM.
+""",
+
+    "hikvision": """\
+## HIKVISION SPECIFIC RECOVERY
+
+Hikvision IP cameras use HiSilicon ARM SoCs (hi3516, hi3518, hi3519).
+
+### Known Hikvision Issues
+1. **HiSilicon SDK**: Requires /dev/hi35* device nodes. Create stubs:
+   mknod /dev/hi_mipi c 10 200
+   mknod /dev/isp_dev c 10 201
+   mknod /dev/vpss c 10 202
+2. **davinci**: Proprietary media daemon. Will crash without hardware.
+   Focus on getting httpd/web service only.
+3. **Multi-port services**: HTTP(80), RTSP(554), SDK(8000).
+   Web UI is the easiest to get running.
+4. **Activation**: Newer firmware requires "activation" before use.
+   May need to patch out activation check in httpd.
+""",
+
+    "dahua": """\
+## DAHUA SPECIFIC RECOVERY
+
+Dahua cameras/NVRs use various ARM SoCs.
+
+### Known Dahua Issues
+1. **Custom init**: Uses proprietary Service.sh and DahuaWatchdog.
+   May need to bypass watchdog to prevent restart loops.
+2. **Multiple network ports**: HTTP(80), RTSP(554), TCP(37777), UDP(37778).
+3. **Encryption**: Some Dahua firmware encrypts config partitions.
+   If /etc/passwd is encrypted, focus on web service only.
+4. **Hardware abstraction**: Heavy use of /dev/dav* device nodes.
+   Create stubs for basic emulation.
+""",
+}

@@ -226,25 +226,100 @@ class EmulationPipeline:
     # ------------------------------------------------------------------
 
     def _run_extract(self) -> None:
-        """Phase 1: Extract firmware rootfs."""
+        """Phase 1: Extract firmware rootfs.
+
+        Runs up to 3 extraction attempts with progressively more aggressive
+        strategies. After each agent run we validate that a real rootfs
+        directory exists on disk -- the agent's textual summary is never
+        trusted as proof of success.
+        """
         self._set_phase(PipelinePhase.EXTRACT)
 
-        prompt = EXTRACT_PROMPT.format(
-            firmware_path=self.state.firmware_path,
-        )
-        self.agent.inject_context(prompt)
-        result = self.agent.run_until_done(max_iterations=15)
+        max_extract_retries = 3
+        extraction_strategies = [
+            # Attempt 1: standard binwalk via agent
+            EXTRACT_PROMPT.format(firmware_path=self.state.firmware_path),
+            # Attempt 2: force recursive matryoshka + sasquatch
+            (
+                "The previous extraction attempt did NOT produce a valid root "
+                "filesystem.  Try these strategies in order and stop as soon as "
+                "one yields a directory containing /bin, /etc, /lib, /sbin:\n"
+                "1. binwalk -Me -C {workdir} {firmware_path}  (recursive matryoshka)\n"
+                "2. For each SquashFS blob found by binwalk, try: "
+                "sasquatch -d {workdir}/squashfs-root <blob>\n"
+                "3. If a TRX header is present, skip the first 28-64 bytes and "
+                "re-run binwalk on the payload: "
+                "dd if={firmware_path} bs=1 skip=<offset> | binwalk -Me -C {workdir}\n"
+                "Report the EXACT path to the extracted rootfs directory."
+            ).format(
+                workdir=self.state.workdir,
+                firmware_path=self.state.firmware_path,
+            ),
+            # Attempt 3: brute-force offset carving
+            (
+                "Extraction is still failing.  Use a brute-force approach:\n"
+                "1. Run: binwalk -E {firmware_path} to check for encryption "
+                "(high entropy > 0.95 across the image means encrypted -- report and stop).\n"
+                "2. List every SquashFS/CramFS/JFFS2 signature offset: "
+                "binwalk -y squashfs -y cramfs -y jffs2 {firmware_path}\n"
+                "3. For each offset, carve and extract: "
+                "dd if={firmware_path} bs=1 skip=<decimal_offset> of={workdir}/carved.bin && "
+                "binwalk -e -C {workdir}/carved_out {workdir}/carved.bin\n"
+                "Report the EXACT path to the extracted rootfs directory, or "
+                "explain precisely why extraction is impossible."
+            ).format(
+                workdir=self.state.workdir,
+                firmware_path=self.state.firmware_path,
+            ),
+        ]
 
-        # Check if agent found a rootfs
-        rootfs = self.agent.get_context_var("rootfs_path")
-        if not rootfs:
-            # Try to find it ourselves from the workdir
-            rootfs = find_rootfs(self.state.workdir)
+        rootfs = None
+        last_agent_output = ""
+
+        for attempt in range(max_extract_retries):
+            prompt = extraction_strategies[attempt]
+            self.agent.inject_context(prompt)
+            last_agent_output = self.agent.run_until_done(max_iterations=15)
+
+            # --- Ground-truth validation (never trust the agent's summary) ---
+            # 1. Check if the agent explicitly set the rootfs path
+            rootfs = self.agent.get_context_var("rootfs_path")
+            if rootfs and Path(rootfs).is_dir():
+                # Verify it actually looks like a rootfs
+                children = {c.name for c in Path(rootfs).iterdir() if c.is_dir()}
+                if {"bin", "etc", "lib", "sbin"}.issubset(children):
+                    break
+                else:
+                    logger.warning(
+                        "Agent-reported rootfs '%s' missing core dirs (has: %s), "
+                        "falling back to search",
+                        rootfs, children,
+                    )
+                    rootfs = None
+
+            # 2. Search the workdir ourselves
+            if not rootfs:
+                rootfs = find_rootfs(self.state.workdir)
+
+            if rootfs:
+                break
+
+            logger.warning(
+                "Extraction attempt %d/%d: no valid rootfs found, retrying",
+                attempt + 1, max_extract_retries,
+            )
+            # Feed the failure back so the agent knows it failed
+            self.agent.inject_context(
+                "[SYSTEM] The previous extraction attempt FAILED -- no directory "
+                "containing /bin, /etc, /lib, /sbin was found on disk. "
+                "Your summary was incorrect. Try the next strategy."
+            )
 
         if not rootfs:
             raise RuntimeError(
-                "Extraction failed: could not locate root filesystem. "
-                f"Agent output: {result[:500]}"
+                f"Extraction failed after {max_extract_retries} attempts: "
+                "could not locate root filesystem on disk. "
+                f"Last agent output: {last_agent_output[:500]}"
             )
 
         self.state.rootfs_path = rootfs

@@ -50,7 +50,7 @@ def _setup_logging(verbose: bool, debug: bool) -> None:
 # Main CLI group
 # ---------------------------------------------------------------------------
 
-@click.group()
+@click.group(context_settings={"ignore_unknown_options": True})
 @click.version_option(version=__version__, prog_name="iotghost")
 def main() -> None:
     """IoTGhost -- AI-powered IoT firmware emulator.

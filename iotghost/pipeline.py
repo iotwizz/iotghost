@@ -9,6 +9,8 @@ state transitions, retry logic, and coordination between modules.
 from __future__ import annotations
 
 import logging
+import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -36,17 +38,271 @@ from iotghost.network import NetworkConfig, NetworkManager, detect_host_interfac
 from iotghost.nvram import NvramConfig, deploy_nvram, scan_rootfs_for_nvram
 from iotghost.prompts import (
     ANALYZE_PROMPT,
+    BINARY_FIX_PROMPT,
     EMULATE_PROMPT,
     EXTRACT_PROMPT,
     FIX_PROMPT,
+    KERNEL_BUILD_PROMPT,
+    NVRAM_RECOVERY_PROMPT,
     PREPARE_PROMPT,
+    QEMU_BOOT_FIX_PROMPT,
     SYSTEM_PROMPT,
+    VENDOR_RECOVERY_PROMPTS,
     VERIFY_PROMPT,
 )
 from iotghost.tools import register_all_tools
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Boot diagnosis helpers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BootDiagnosis:
+    """Structured diagnosis of a QEMU boot failure."""
+    failure_type: str       # kernel_panic, init_fail, nvram_crash, lib_missing,
+                            # arch_mismatch, network_fail, qemu_crash, unknown
+    root_cause: str         # human-readable root cause
+    recommended_fix: str    # actionable fix description
+    raw_evidence: str       # the matching log line(s)
+    binary_path: str = ""   # relevant binary if applicable
+
+
+# Ordered by priority -- first match wins
+_BOOT_FAILURE_PATTERNS: list[tuple[str, re.Pattern, str, str]] = [
+    (
+        "arch_mismatch",
+        re.compile(
+            r"(?:Invalid ELF|ELF binary.*unexpected|Exec format error"
+            r"|cannot execute binary|wrong ELF class)",
+            re.IGNORECASE,
+        ),
+        "Architecture mismatch: kernel and rootfs binaries are for different CPUs.",
+        "Verify kernel arch matches rootfs: run `file <kernel>` and `file <rootfs>/bin/busybox`. "
+        "If mismatched, select the correct pre-built kernel or build one with Buildroot.",
+    ),
+    (
+        "kernel_panic",
+        re.compile(
+            r"Kernel panic.*(?:not syncing|VFS|Unable to mount root|No init found"
+            r"|No working init|Attempted to kill init)",
+            re.IGNORECASE,
+        ),
+        "Kernel panic during boot: {match}",
+        "Check: 1) root= parameter matches actual device (sda1/vda), "
+        "2) kernel has driver for rootfs filesystem type (ext4/squashfs), "
+        "3) /sbin/init or /etc/init.d/rcS exists in rootfs. "
+        "Try booting with init=/bin/sh to isolate kernel vs userspace.",
+    ),
+    (
+        "init_fail",
+        re.compile(
+            r"(?:can't run '/etc/init\.d/rcS'|can't run '/sbin/init'"
+            r"|Failed to execute /init|Run /sbin/init as init process"
+            r"|No init found|applet not found)",
+            re.IGNORECASE,
+        ),
+        "Init system failure: the init binary or script is missing/broken.",
+        "Check: 1) /sbin/init exists and is executable, "
+        "2) /etc/inittab references correct paths, "
+        "3) busybox applets are properly linked. "
+        "Try creating a minimal init: #!/bin/sh\\nexec /etc/init.d/rcS",
+    ),
+    (
+        "nvram_crash",
+        re.compile(
+            r"(?:nvram_get.*(?:not found|segfault|SIGSEGV)"
+            r"|libnvram.*(?:not found|No such)"
+            r"|LD_PRELOAD.*(?:cannot|failed|not found)"
+            r"|nvram.*(?:Segmentation fault|core dumped))",
+            re.IGNORECASE,
+        ),
+        "NVRAM emulation failure: services crash because libnvram interception is broken.",
+        "Verify: 1) libnvram.so exists at LD_PRELOAD path AND matches rootfs arch, "
+        "2) nvram.ini has required vendor keys, "
+        "3) LD_PRELOAD path is absolute inside chroot. "
+        "Test: chroot <rootfs> qemu-<arch>-static -E LD_PRELOAD=/libnvram.so /bin/sh",
+    ),
+    (
+        "lib_missing",
+        re.compile(
+            r"(?:error while loading shared libraries"
+            r"|cannot open shared object file"
+            r"|NEEDED.*not found)",
+            re.IGNORECASE,
+        ),
+        "Missing shared library: a critical binary cannot find required .so files.",
+        "Run `readelf -d <binary> | grep NEEDED` to list deps, "
+        "then `find <rootfs>/lib -name '<lib>'`. Copy missing libs or create symlinks.",
+    ),
+    (
+        "lib_missing",
+        re.compile(r"Segmentation fault|SIGSEGV|Illegal instruction|SIGILL", re.IGNORECASE),
+        "Binary crash (segfault/illegal instruction): likely arch mismatch or missing library.",
+        "Run `readelf -h <binary>` to verify architecture. "
+        "Then `strace -f <binary>` to find failing syscall.",
+    ),
+    (
+        "network_fail",
+        re.compile(
+            r"(?:Network is unreachable|SIOCSIFADDR.*No such device"
+            r"|eth0.*not found|br0.*does not exist)",
+            re.IGNORECASE,
+        ),
+        "Network configuration failure inside emulated firmware.",
+        "Check QEMU NIC model matches kernel driver, firmware interface names, "
+        "and ifconfig/ip commands in init scripts.",
+    ),
+    (
+        "qemu_crash",
+        re.compile(
+            r"(?:qemu.*(?:Segmentation fault|abort|core dump)"
+            r"|qemu:.*(?:unsupported|unhandled)"
+            r"|QEMU.*(?:error|fatal)"
+            r"|Could not open.*No such file)",
+            re.IGNORECASE,
+        ),
+        "QEMU process itself crashed or failed to start.",
+        "Check: 1) qemu-system-<arch> installed and correct, "
+        "2) kernel file exists and is valid ELF, "
+        "3) rootfs image valid and non-empty, "
+        "4) machine type (-M) compatible with kernel.",
+    ),
+]
+
+
+def _diagnose_boot_failure(serial_log: str, qemu_stderr: str = "") -> BootDiagnosis:
+    """Parse serial log and QEMU stderr for known failure signatures."""
+    combined = serial_log + "\n" + qemu_stderr
+
+    for failure_type, pattern, cause_tpl, fix_tpl in _BOOT_FAILURE_PATTERNS:
+        match = pattern.search(combined)
+        if match:
+            matched_text = match.group(0)[:200]
+            match_start = match.start()
+            ctx_start = combined.rfind("\n", 0, max(0, match_start - 200))
+            ctx_end = combined.find("\n", min(len(combined), match_start + 300))
+            evidence = combined[max(0, ctx_start):min(len(combined), ctx_end)].strip()
+
+            root_cause = cause_tpl.format(match=matched_text) if "{match}" in cause_tpl else cause_tpl
+
+            binary_path = ""
+            bin_match = re.search(r"(/\S+(?:httpd|nginx|sbin/init|bin/sh|lighttpd|uhttpd))", evidence)
+            if bin_match:
+                binary_path = bin_match.group(1)
+
+            return BootDiagnosis(
+                failure_type=failure_type,
+                root_cause=root_cause,
+                recommended_fix=fix_tpl,
+                raw_evidence=evidence[:500],
+                binary_path=binary_path,
+            )
+
+    last_lines = "\n".join(combined.strip().splitlines()[-20:])
+    return BootDiagnosis(
+        failure_type="unknown",
+        root_cause="Boot failed but no recognized error pattern found in log.",
+        recommended_fix="Try: 1) init=/bin/sh to test basic kernel+rootfs, "
+                        "2) Check dmesg for driver errors, "
+                        "3) Verify QEMU machine type and CPU model.",
+        raw_evidence=last_lines[:500],
+    )
+
+
+def _detect_vendor(rootfs_path: str) -> str | None:
+    """Detect firmware vendor from rootfs file contents."""
+    rootfs = Path(rootfs_path)
+    vendor_indicators: dict[str, list[str]] = {
+        "tenda": ["tenda", "Tenda", "TENDA", "tdcore", "tdhttpd"],
+        "dlink": ["D-Link", "dlink", "DLINK", "mydlink"],
+        "tplink": ["TP-LINK", "TP-Link", "tplink"],
+        "netgear": ["NETGEAR", "Netgear", "netgear"],
+        "asus": ["ASUS", "Asus", "RT-AC", "RT-N", "asuswrt"],
+        "hikvision": ["Hikvision", "hikvision", "HIKVISION", "hi35"],
+        "dahua": ["Dahua", "dahua", "DAHUA"],
+    }
+    scan_paths = [
+        "etc/banner", "etc/issue", "etc/version", "etc/os-release",
+        "www/index.html", "www/login.html", "web/index.html",
+    ]
+    for scan_rel in scan_paths:
+        scan_file = rootfs / scan_rel
+        if scan_file.is_file():
+            try:
+                content = scan_file.read_text(errors="replace")[:4096]
+                for vendor, indicators in vendor_indicators.items():
+                    for indicator in indicators:
+                        if indicator in content:
+                            logger.info("Vendor detected: %s (found '%s' in %s)", vendor, indicator, scan_rel)
+                            return vendor
+            except OSError:
+                continue
+    return None
+
+
+def _select_fix_prompt(
+    diagnosis: BootDiagnosis,
+    rootfs_path: str,
+    arch: str,
+    vendor: str | None,
+    previous_fixes: str,
+) -> str:
+    """Select the best fix prompt based on boot failure diagnosis.
+
+    Returns a fully-formatted prompt string combining the structured
+    FIX_PROMPT with diagnosis-specific expert guidance.
+    """
+    # Base fix prompt with diagnosis
+    base_prompt = FIX_PROMPT.format(
+        diagnosis_summary=f"[{diagnosis.failure_type.upper()}] {diagnosis.root_cause}",
+        root_cause=diagnosis.root_cause,
+        recommended_fix=diagnosis.recommended_fix,
+        error_output=diagnosis.raw_evidence,
+        previous_fixes=previous_fixes or "None yet",
+    )
+
+    # Add expert prompt based on failure type
+    expert_section = ""
+
+    if diagnosis.failure_type in ("kernel_panic", "arch_mismatch"):
+        expert_section = "\n\n## EXPERT: KERNEL RECOVERY\n" + KERNEL_BUILD_PROMPT
+    elif diagnosis.failure_type == "lib_missing":
+        expert_section = "\n\n## EXPERT: BINARY/LIBRARY RECOVERY\n" + BINARY_FIX_PROMPT
+    elif diagnosis.failure_type == "nvram_crash":
+        try:
+            expert_section = "\n\n## EXPERT: NVRAM RECOVERY\n" + NVRAM_RECOVERY_PROMPT.format(
+                rootfs_path=rootfs_path,
+                arch=arch,
+                vendor=vendor or "unknown",
+            )
+        except KeyError as exc:
+            logger.warning("NVRAM_RECOVERY_PROMPT format error (missing key %s), using raw", exc)
+            expert_section = "\n\n## EXPERT: NVRAM RECOVERY\n" + NVRAM_RECOVERY_PROMPT
+    elif diagnosis.failure_type == "qemu_crash":
+        try:
+            expert_section = "\n\n## EXPERT: QEMU BOOT FIX\n" + QEMU_BOOT_FIX_PROMPT.format(
+                diagnosis=diagnosis.root_cause,
+                serial_evidence=diagnosis.raw_evidence[:300],
+                recommended_fix=diagnosis.recommended_fix,
+            )
+        except KeyError as exc:
+            logger.warning("QEMU_BOOT_FIX_PROMPT format error (missing key %s), using raw", exc)
+            expert_section = "\n\n## EXPERT: QEMU BOOT FIX\n" + QEMU_BOOT_FIX_PROMPT
+
+    # Add vendor-specific guidance if available
+    vendor_section = ""
+    if vendor and vendor in VENDOR_RECOVERY_PROMPTS:
+        vendor_section = "\n\n## VENDOR-SPECIFIC GUIDANCE\n" + VENDOR_RECOVERY_PROMPTS[vendor]
+
+    return base_prompt + expert_section + vendor_section
+
+
+# ---------------------------------------------------------------------------
+# Pipeline phases and state
+# ---------------------------------------------------------------------------
 
 class PipelinePhase(str, Enum):
     """Phases of the emulation pipeline."""
@@ -97,6 +353,11 @@ class PipelineState:
     phase_times: dict[str, float] = field(default_factory=dict)
     accessible_services: list[tuple[str, int]] = field(default_factory=list)
     final_status: str = ""
+    # --- New fields for diagnosis-aware emulation ---
+    vendor: str | None = None
+    emulation_status: str = ""
+    degraded_boot: bool = False
+    degraded_diagnosis: str = ""
 
     @property
     def elapsed(self) -> float:
@@ -517,6 +778,125 @@ class EmulationPipeline:
                     continue
         return "unknown"
 
+    def _preflight_checks(self) -> list[str]:
+        """Run deterministic pre-flight checks before QEMU launch.
+
+        Verifies kernel/rootfs compatibility and fixes common issues
+        automatically without wasting agent iterations.
+
+        Returns list of issues found and auto-fixed.
+        """
+        issues_fixed: list[str] = []
+        state = self.state
+        rootfs_path = str(state.rootfs_path) if state.rootfs_path else None
+
+        if not rootfs_path or not Path(rootfs_path).exists():
+            logger.warning("Preflight: rootfs path not available, skipping checks")
+            return issues_fixed
+
+        rootfs = Path(rootfs_path)
+
+        # 1. Check init path exists
+        init_paths = [
+            rootfs / "sbin" / "init",
+            rootfs / "etc" / "init.d" / "rcS",
+            rootfs / "init",
+            rootfs / "bin" / "sh",
+        ]
+        init_found = any(p.exists() for p in init_paths)
+        if not init_found:
+            # Create a minimal init script
+            init_dir = rootfs / "etc" / "init.d"
+            init_dir.mkdir(parents=True, exist_ok=True)
+            rcs = init_dir / "rcS"
+            rcs.write_text(
+                "#!/bin/sh\nmount -t proc proc /proc\n"
+                "mount -t sysfs sysfs /sys\nexec /bin/sh\n"
+            )
+            rcs.chmod(0o755)
+            # Also create /sbin/init -> /etc/init.d/rcS
+            sbin = rootfs / "sbin"
+            sbin.mkdir(parents=True, exist_ok=True)
+            sbin_init = sbin / "init"
+            if not sbin_init.exists():
+                sbin_init.symlink_to("/etc/init.d/rcS")
+            issues_fixed.append("Created missing /etc/init.d/rcS and /sbin/init")
+            logger.info("Preflight: created missing init scripts")
+
+        # 2. Check critical device nodes
+        dev_dir = rootfs / "dev"
+        dev_dir.mkdir(parents=True, exist_ok=True)
+        required_nodes = {
+            "console": (5, 1),    # char major 5, minor 1
+            "null": (1, 3),       # char major 1, minor 3
+            "ttyS0": (4, 64),     # char major 4, minor 64
+            "ttyAMA0": (204, 64), # char major 204, minor 64
+            "zero": (1, 5),       # char major 1, minor 5
+        }
+        for name, (major, minor) in required_nodes.items():
+            node_path = dev_dir / name
+            if not node_path.exists():
+                try:
+                    os.mknod(
+                        str(node_path),
+                        0o666 | 0o020000,
+                        os.makedev(major, minor),
+                    )
+                    issues_fixed.append(f"Created /dev/{name}")
+                except (OSError, PermissionError) as e:
+                    # mknod may require root -- log but don't fail
+                    logger.debug("Preflight: cannot create /dev/%s: %s", name, e)
+
+        # 3. Check /proc and /sys mountpoints exist
+        for mp in ["proc", "sys", "tmp"]:
+            mp_path = rootfs / mp
+            if not mp_path.exists():
+                mp_path.mkdir(parents=True, exist_ok=True)
+                issues_fixed.append(f"Created /{mp} mountpoint")
+
+        # 4. Verify NVRAM setup if needed
+        if state.needs_nvram:
+            nvram_lib_paths = [
+                rootfs / "usr" / "lib" / "libnvram.so",
+                rootfs / "lib" / "libnvram.so",
+                rootfs / "usr" / "lib" / "libnvram-0.3.so",
+            ]
+            nvram_found = any(p.exists() for p in nvram_lib_paths)
+            if not nvram_found:
+                issues_fixed.append(
+                    "WARNING: NVRAM needed but libnvram.so not found in rootfs"
+                )
+                logger.warning(
+                    "Preflight: libnvram.so not found -- NVRAM emulation may fail"
+                )
+
+            nvram_ini = rootfs / "etc" / "nvram.ini"
+            if not nvram_ini.exists():
+                issues_fixed.append(
+                    "WARNING: NVRAM needed but /etc/nvram.ini not found"
+                )
+                logger.warning("Preflight: nvram.ini missing")
+
+        # 5. Check rootfs image file (if separate from directory)
+        if state.rootfs_image and Path(state.rootfs_image).exists():
+            img_size = Path(state.rootfs_image).stat().st_size
+            if img_size < 1024:
+                issues_fixed.append(
+                    f"WARNING: rootfs image is very small ({img_size} bytes)"
+                )
+                logger.warning(
+                    "Preflight: rootfs image is only %d bytes", img_size
+                )
+
+        if issues_fixed:
+            logger.info(
+                "Preflight checks: %d issues found/fixed", len(issues_fixed)
+            )
+        else:
+            logger.info("Preflight checks: all clear")
+
+        return issues_fixed
+
     def _run_emulate_loop(self) -> None:
         """Phase 4+5: Emulate with fix loop.
 
@@ -573,7 +953,30 @@ class EmulationPipeline:
         else:
             logger.info("Using QEMU user-mode networking (no host setup needed)")
 
-        while self.state.fix_attempts <= self.config.max_fix_attempts:
+        # --- Pre-flight checks ---
+        preflight_issues = self._preflight_checks()
+        if preflight_issues:
+            logger.info(
+                "Preflight fixed %d issues: %s",
+                len(preflight_issues), preflight_issues,
+            )
+
+        # Detect vendor for vendor-specific recovery
+        vendor = (
+            _detect_vendor(str(self.state.rootfs_path))
+            if self.state.rootfs_path
+            else None
+        )
+        if vendor:
+            logger.info("Detected vendor: %s", vendor)
+            self.state.vendor = vendor  # Store for later use
+
+        previous_fixes: list[str] = []  # Track what we've tried
+        max_fix_attempts = self.config.max_fix_attempts
+        serial_path = Path(self.state.workdir) / "serial.log"
+        diagnosis: BootDiagnosis | None = None  # last diagnosis for degraded boot
+
+        while self.state.fix_attempts <= max_fix_attempts:
             # Launch QEMU
             self.qemu = QemuManager(
                 config=qemu_config,
@@ -606,49 +1009,182 @@ class EmulationPipeline:
             self.state.fix_attempts += 1
             self.state.last_error = self.qemu.state.last_error or "Unknown boot failure"
 
-            if self.state.fix_attempts > self.config.max_fix_attempts:
+            if self.state.fix_attempts > max_fix_attempts:
                 logger.error(
                     "Max fix attempts (%d) reached. Giving up.",
-                    self.config.max_fix_attempts,
+                    max_fix_attempts,
                 )
-                self._set_phase(PipelinePhase.FAILED)
-                self.state.final_status = "failed_max_retries"
-                return
+                break  # Fall through to degraded boot
 
             # Stop current QEMU instance
             self.qemu.stop()
 
-            # Run fix phase
+            # Run fix phase with structured diagnosis
             self._set_phase(PipelinePhase.FIX)
-            error_output = self.qemu.get_recent_output(lines=30)
-            previous_fixes = "\n".join(
-                f"- {fix}" for fix in self.agent.state.attempted_fixes
-            ) or "None yet"
 
-            prompt = FIX_PROMPT.format(
-                error_output=error_output,
-                previous_fixes=previous_fixes,
+            # Read FULL serial log for diagnosis
+            serial_log = ""
+            if serial_path.exists():
+                try:
+                    serial_log = serial_path.read_text(errors="replace")
+                except OSError:
+                    serial_log = ""
+
+            # Get QEMU stderr if available
+            qemu_stderr = ""
+            if (
+                hasattr(self.qemu, '_process')
+                and self.qemu._process
+                and self.qemu._process.stderr
+            ):
+                try:
+                    qemu_stderr = self.qemu._process.stderr.read() or ""
+                except Exception:
+                    pass
+
+            # Structured diagnosis
+            diagnosis = _diagnose_boot_failure(serial_log, qemu_stderr)
+            logger.info(
+                "Boot diagnosis: type=%s cause=%s",
+                diagnosis.failure_type, diagnosis.root_cause[:100],
             )
-            self.agent.inject_context(prompt)
+
+            # Select context-specific fix prompt
+            fix_prompt = _select_fix_prompt(
+                diagnosis=diagnosis,
+                rootfs_path=str(self.state.rootfs_path or ""),
+                arch=str(self.state.architecture or ""),
+                vendor=getattr(self.state, 'vendor', None),
+                previous_fixes="\n".join(
+                    f"  Attempt {i+1}: {f}"
+                    for i, f in enumerate(previous_fixes)
+                ),
+            )
+
+            self.agent.inject_context(fix_prompt)
             fix_result = self.agent.run_until_done(max_iterations=10)
             self.agent.state.attempted_fixes.append(fix_result[:200])
 
+            # Record what was tried
+            previous_fixes.append(
+                f"[{diagnosis.failure_type}] Agent attempted fix for: "
+                f"{diagnosis.root_cause[:80]}"
+            )
+
             # Back to emulate phase for retry
             self._set_phase(PipelinePhase.EMULATE)
-            logger.info("Fix attempt %d complete, retrying emulation", self.state.fix_attempts)
+            logger.info(
+                "Fix attempt %d complete, retrying emulation",
+                self.state.fix_attempts,
+            )
+
+        # --- Degraded mode boot attempt ---
+        logger.warning(
+            "All %d fix attempts exhausted. Trying degraded boot "
+            "(init=/bin/sh)...",
+            max_fix_attempts,
+        )
+
+        # Stop QEMU if still running
+        if self.qemu and self.qemu.is_running():
+            self.qemu.stop()
+
+        # Modify kernel append to use init=/bin/sh
+        original_append = qemu_config.kernel_append or ""
+        degraded_append = (
+            re.sub(r'init=\S+', '', original_append).strip()
+            + " init=/bin/sh"
+        )
+        qemu_config.kernel_append = degraded_append
+
+        try:
+            self.qemu = QemuManager(
+                config=qemu_config,
+                on_serial_line=lambda line: logger.debug("SERIAL: %s", line),
+            )
+            self.qemu.start()
+            time.sleep(10)  # Give it time to boot to shell
+
+            # Check if we got a shell prompt
+            degraded_serial = ""
+            if serial_path.exists():
+                degraded_serial = serial_path.read_text(errors="replace")
+
+            if (
+                "/ #" in degraded_serial
+                or "~ #" in degraded_serial
+                or "/bin/sh" in degraded_serial
+            ):
+                logger.info(
+                    "Degraded boot SUCCESS: kernel + rootfs basic stack works"
+                )
+                self.state.emulation_status = "PARTIAL"
+                self.state.degraded_boot = True
+                last_cause = (
+                    diagnosis.root_cause if diagnosis else "unknown"
+                )
+                self.state.degraded_diagnosis = (
+                    "Kernel and rootfs are functional (shell accessible), "
+                    "but userspace services failed to start. "
+                    f"Original failure: {last_cause}"
+                )
+                # Restore original append for potential retry
+                qemu_config.kernel_append = original_append
+                return  # Continue to VERIFY with partial status
+            else:
+                degraded_diag = _diagnose_boot_failure(degraded_serial)
+                logger.warning(
+                    "Degraded boot also failed: %s",
+                    degraded_diag.root_cause,
+                )
+                self.state.emulation_status = "FAILED"
+                self.state.degraded_diagnosis = (
+                    "Both normal and degraded boot failed. "
+                    f"Fundamental issue: {degraded_diag.root_cause}"
+                )
+        except Exception as e:
+            logger.error("Degraded boot exception: %s", e)
+            self.state.degraded_diagnosis = f"Degraded boot crashed: {e}"
+        finally:
+            try:
+                if self.qemu:
+                    self.qemu.stop()
+            except Exception:
+                pass
+            # Restore original append
+            qemu_config.kernel_append = original_append
+
+        self._set_phase(PipelinePhase.FAILED)
+        self.state.final_status = "failed_max_retries"
 
     def _run_verify(self) -> None:
         """Phase 6: Verify the firmware is running and services are accessible."""
         self._set_phase(PipelinePhase.VERIFY)
 
+        # Include degraded boot info in verify prompt if applicable
+        extra_context = ""
+        if self.state.degraded_boot:
+            extra_context = (
+                "\n\nNOTE: Firmware booted in DEGRADED MODE (init=/bin/sh). "
+                "Full userspace services are NOT running. "
+                f"Diagnosis: {self.state.degraded_diagnosis}\n"
+                "Verify what IS accessible: check if kernel booted, "
+                "if basic shell commands work, and report PARTIAL status."
+            )
+
         prompt = VERIFY_PROMPT.format(
             device_ip=self.config.device_ip,
         )
+        if extra_context:
+            prompt += extra_context
+
         self.agent.inject_context(prompt)
         result = self.agent.run_until_done(max_iterations=10)
 
         # Parse verification results
-        if "RUNNING" in result.upper():
+        if self.state.degraded_boot:
+            self.state.final_status = "partial"
+        elif "RUNNING" in result.upper():
             self.state.final_status = "running"
         elif "PARTIAL" in result.upper():
             self.state.final_status = "partial"
@@ -689,6 +1225,12 @@ class EmulationPipeline:
             "elapsed": round(self.state.elapsed, 1),
             "final_status": self.state.final_status,
         }
+
+        if self.state.degraded_boot:
+            status["degraded_boot"] = True
+            status["degraded_diagnosis"] = self.state.degraded_diagnosis
+        if self.state.vendor:
+            status["vendor"] = self.state.vendor
 
         if self.agent:
             status["agent"] = self.agent.get_stats()

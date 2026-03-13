@@ -20,7 +20,13 @@ from typing import Any, Callable
 
 import httpx
 
-from iotghost.prompts import SELF_HEAL_PROMPT, SYSTEM_PROMPT
+from iotghost.prompts import (
+    BINARY_FIX_PROMPT,
+    KERNEL_BUILD_PROMPT,
+    NVRAM_RECOVERY_PROMPT,
+    SELF_HEAL_PROMPT,
+    SYSTEM_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +116,9 @@ ERROR_CATEGORIES = {
     "disk": re.compile(r"No space left|ENOSPC|Disk quota exceeded", re.I),
     "network": re.compile(r"Connection refused|ECONNREFUSED|Network unreachable", re.I),
     "busy": re.compile(r"Device or resource busy|EBUSY", re.I),
+    "kernel_panic": re.compile(r"Kernel panic|not syncing|VFS:.*Unable to mount", re.I),
+    "arch_mismatch": re.compile(r"Illegal instruction|SIGILL|Invalid ELF|wrong ELF class|exec format error", re.I),
+    "nvram": re.compile(r"nvram|libnvram|nvram_get|nvram\.ini", re.I),
 }
 
 
@@ -148,6 +157,7 @@ class ErrorTracker:
         self.total_failures: int = 0
         self.errors_by_category: dict[str, int] = {}
         self._corrective_injections: int = 0
+        self.auto_fix_failures: int = 0  # Layer 1 shell auto-fix failures
 
     def reset(self) -> None:
         """Reset all tracking (called at phase start)."""
@@ -157,10 +167,11 @@ class ErrorTracker:
         self.total_failures = 0
         self.errors_by_category.clear()
         self._corrective_injections = 0
+        self.auto_fix_failures = 0
 
     def record_success(self) -> None:
-        """Record a successful command -- resets consecutive failure count."""
-        self.consecutive_failures = 0
+        """Record a successful command -- reduces consecutive failure count."""
+        self.consecutive_failures = max(0, self.consecutive_failures - 1)
 
     def record_error(self, iteration: int, command: str, error_text: str) -> None:
         """Record a command failure and classify it."""
@@ -269,6 +280,51 @@ class ErrorTracker:
     @property
     def has_errors(self) -> bool:
         return self.total_failures > 0
+
+    def record_auto_fix_failure(self) -> None:
+        """Record a failed auto-fix from shell Layer 1.
+
+        This feeds Layer 1 failures into Layer 2 stuck detection,
+        so the ErrorTracker escalates sooner when auto-fix keeps failing.
+        """
+        self.auto_fix_failures += 1
+        # Every 3 auto-fix failures counts as 1 consecutive failure
+        if self.auto_fix_failures % 3 == 0:
+            self.consecutive_failures += 1
+
+    def dominant_category(self) -> str | None:
+        """Return the error category with the most occurrences, or None.
+
+        Used to select the matching expert prompt for recurring errors.
+        """
+        if not self.errors_by_category:
+            return None
+        top = max(self.errors_by_category, key=self.errors_by_category.get)
+        # Only return if category has 2+ occurrences (not a one-off)
+        if self.errors_by_category[top] >= 2:
+            return top
+        return None
+
+    def get_expert_prompt(self) -> str | None:
+        """Select the best expert prompt based on recurring error categories.
+
+        Maps dominant error categories to specialized recovery prompts.
+        Returns None if no clear category dominates.
+        """
+        category = self.dominant_category()
+        if category is None:
+            return None
+
+        # Map error categories to expert prompts
+        category_to_prompt: dict[str, str] = {
+            "kernel_panic": KERNEL_BUILD_PROMPT,
+            "arch_mismatch": KERNEL_BUILD_PROMPT,
+            "crash": BINARY_FIX_PROMPT,
+            "nvram": NVRAM_RECOVERY_PROMPT,
+            "missing_file": BINARY_FIX_PROMPT,  # often missing libs
+        }
+
+        return category_to_prompt.get(category)
 
 
 # ---------------------------------------------------------------------------
@@ -598,7 +654,7 @@ class ShellAgent:
             if self._self_heal_enabled:
                 stuck_type = self.error_tracker.detect_stuck()
                 if stuck_type:
-                    self._inject_corrective_prompt(stuck_type)
+                    self._inject_corrective_prompt()
 
             # --- Context window management ---
             self._trim_context_if_needed()
@@ -606,65 +662,92 @@ class ShellAgent:
         logger.warning("Agent hit iteration limit (%d)", limit)
         return f"[IoTGhost] Reached maximum iterations ({limit}). Last phase: {self.state.phase}"
 
-    def _inject_corrective_prompt(self, stuck_type: str) -> None:
-        """Inject a corrective system message when stuck is detected.
+    def _inject_corrective_prompt(self) -> None:
+        """Inject a corrective prompt based on escalation tier.
 
-        Forces the LLM to reassess its approach by providing diagnostic
-        context and explicit instructions to try something different.
+        Tier 1 (1-3 failures): Targeted hint based on dominant error category
+        Tier 2 (4-6 failures): Full SELF_HEAL_PROMPT with diagnostic context
+        Tier 3 (7+ failures):  Force phase skip -- this issue cannot be resolved
         """
-        self.error_tracker._corrective_injections += 1
-        diag = self.error_tracker.build_diagnostic_context()
+        failures = self.error_tracker.consecutive_failures
+        stuck_type = self.error_tracker.detect_stuck()
 
-        strategies = {
-            "repeater": (
-                "You are REPEATING the exact same failing command. STOP. "
-                "The command will not work no matter how many times you retry it. "
-                "You MUST use a completely different approach. "
-                "Use idempotent alternatives: mkdir -p, cp -af, ln -sf, "
-                "test -e before operating, or skip this step entirely."
-            ),
-            "looper": (
-                "You are LOOPING between the same 2-3 failing commands. "
-                "This cycle will not resolve itself. Step back and re-think. "
-                "What is the ROOT CAUSE? Are you missing a prerequisite step? "
-                "Is the path wrong? Is the filesystem read-only? "
-                "List what you know, then try a fundamentally different approach."
-            ),
-            "stalled": (
-                "You have had {n} consecutive command failures. Something is "
-                "fundamentally wrong with your current approach. "
-                "STOP executing commands and DIAGNOSE: "
-                "1) ls -la the target directories to verify they exist, "
-                "2) Check filesystem mount status with 'mount' and 'df -h', "
-                "3) Verify the rootfs was extracted correctly, "
-                "4) Then formulate a new plan before running any more commands."
-            ).format(n=self.error_tracker.consecutive_failures),
-        }
+        if failures >= 7 or (stuck_type and self.error_tracker._corrective_injections >= 3):
+            # Tier 3: Force skip
+            skip_msg = (
+                "[SYSTEM] CRITICAL: This issue cannot be resolved with current approach. "
+                "The agent has failed {} consecutive times (stuck pattern: {}). "
+                "STOP trying to fix this specific issue. Instead:\n"
+                "1. If in FIX phase: accept partial failure and proceed to VERIFY\n"
+                "2. If in PREPARE phase: skip the failing step and continue\n"
+                "3. If in EMULATE phase: try degraded mode with init=/bin/sh\n"
+                "DO NOT repeat any previous commands."
+            ).format(failures, stuck_type or "exhaustion")
+            msg = Message(role=Role.USER, content=skip_msg)
+            self.state.messages.append(msg)
+            if self._on_message:
+                self._on_message(msg)
+            if self._on_self_heal:
+                self._on_self_heal(self.state.phase, stuck_type or "exhaustion", True)
+            self.error_tracker.consecutive_failures = max(0, failures - 2)
+            self.error_tracker._corrective_injections += 1
+            logger.warning("Tier 3 escalation: forcing phase skip after %d failures", failures)
+            return
 
-        strategy = strategies.get(stuck_type, strategies["stalled"])
+        if failures >= 4:
+            # Tier 2: Full SELF_HEAL_PROMPT
+            diag_context = self.error_tracker.build_diagnostic_context()
+            heal_msg = SELF_HEAL_PROMPT.format(
+                diagnostic_context=diag_context,
+            )
+            # Append expert prompt if we have a dominant category
+            expert = self.error_tracker.get_expert_prompt()
+            if expert:
+                heal_msg += "\n\n## EXPERT RECOVERY GUIDANCE\n" + expert
 
-        # For severe cases (3+ injections), use the full expert prompt
-        if self.error_tracker._corrective_injections >= 3:
-            corrective = SELF_HEAL_PROMPT.format(
-                diagnostic_context=diag,
+            msg = Message(role=Role.USER, content=heal_msg)
+            self.state.messages.append(msg)
+            if self._on_message:
+                self._on_message(msg)
+            if self._on_self_heal:
+                self._on_self_heal(self.state.phase, stuck_type or "stalled", True)
+            self.error_tracker.consecutive_failures = max(0, failures - 2)
+            self.error_tracker._corrective_injections += 1
+            logger.warning("Tier 2 escalation: SELF_HEAL_PROMPT after %d failures", failures)
+            return
+
+        # Tier 1 (1-3 failures): Targeted hint
+        expert = self.error_tracker.get_expert_prompt()
+        if expert:
+            hint_msg = (
+                "[SYSTEM] The last {} commands failed. Error pattern suggests: {}\n\n"
+                "Targeted guidance:\n{}"
+            ).format(
+                failures,
+                self.error_tracker.dominant_category() or "unknown",
+                expert[:800],  # Truncate to keep it focused
             )
         else:
-            corrective = f"[SELF-HEALING] {strategy}\n\n{diag}"
+            # Generic hint
+            recent_errors = list(self.error_tracker.error_history)[-3:]
+            error_summary = "\n".join(
+                f"  - [{e.category}] {e.error_text[:100]}" for e in recent_errors
+            )
+            hint_msg = (
+                "[SYSTEM] The last {} commands failed with these errors:\n{}\n\n"
+                "Try a DIFFERENT approach. Do NOT repeat the same commands. "
+                "Consider: different paths, different tools, or skip this step."
+            ).format(failures, error_summary)
 
-        logger.warning(
-            "Self-healing triggered: %s (injection #%d)",
-            stuck_type, self.error_tracker._corrective_injections,
-        )
-
-        msg = Message(role=Role.USER, content=corrective)
+        msg = Message(role=Role.USER, content=hint_msg)
         self.state.messages.append(msg)
         if self._on_message:
             self._on_message(msg)
         if self._on_self_heal:
-            self._on_self_heal(self.state.phase, stuck_type, True)
-
-        # Reset consecutive counter so we don't immediately re-trigger
-        self.error_tracker.consecutive_failures = 0
+            self._on_self_heal(self.state.phase, stuck_type or "hint", True)
+        self.error_tracker.consecutive_failures = max(0, failures - 2)
+        self.error_tracker._corrective_injections += 1
+        logger.info("Tier 1 hint after %d failures", failures)
 
     def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
         """Execute a single tool call and return the result."""

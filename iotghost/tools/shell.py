@@ -7,17 +7,28 @@ capture, and error normalization.
 Every tool function has a `_schema` attribute containing its OpenAI-compatible
 function schema, which the agent module uses to build tool descriptions for
 the LLM.
+
+Self-Healing Layer 1 -- Auto-Fix Interceptor:
+    When execute_command() detects a known recoverable error pattern in stderr
+    (e.g. 'File exists' from mkdir, 'No such file or directory' from cp/mv),
+    it automatically rewrites the command and retries ONCE before returning
+    the result to the LLM.  This avoids wasting an LLM iteration on trivially
+    fixable shell errors.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import socket
 import struct
 import subprocess
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from iotghost.agent import ToolResult, register_tool
 
@@ -26,6 +37,234 @@ logger = logging.getLogger(__name__)
 # Maximum output size to prevent context window overflow
 MAX_OUTPUT_CHARS = 8000
 TRUNCATION_MSG = "\n... [output truncated to {limit} chars, {total} total]"
+
+# ---------------------------------------------------------------------------
+# Auto-Fix Interceptor -- Self-Healing Layer 1
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AutoFixResult:
+    """Tracks what the auto-fixer did to recover a command."""
+    original_cmd: str
+    fixed_cmd: str
+    error_pattern: str          # which pattern matched
+    strategy: str               # human-readable fix description
+    success: bool = False       # did the retry succeed?
+
+
+# Global state for auto-fix tracking (reset per phase by pipeline)
+_auto_fix_history: list[AutoFixResult] = []
+_auto_fix_count: int = 0
+_max_auto_fixes: int = 10      # cap per phase, configurable via CLI
+_self_heal_enabled: bool = True
+_on_auto_fix: Callable[[AutoFixResult], None] | None = None
+
+
+def configure_auto_fix(
+    enabled: bool = True,
+    max_fixes: int = 10,
+    on_auto_fix: Callable[[AutoFixResult], None] | None = None,
+) -> None:
+    """Configure the auto-fix interceptor (called by pipeline at setup)."""
+    global _self_heal_enabled, _max_auto_fixes, _on_auto_fix
+    _self_heal_enabled = enabled
+    _max_auto_fixes = max_fixes
+    _on_auto_fix = on_auto_fix
+
+
+def reset_auto_fix_state() -> None:
+    """Reset auto-fix counters (called at the start of each phase)."""
+    global _auto_fix_count
+    _auto_fix_count = 0
+    _auto_fix_history.clear()
+
+
+def get_auto_fix_history() -> list[AutoFixResult]:
+    """Return auto-fix history for the current phase."""
+    return list(_auto_fix_history)
+
+
+# --- Error pattern matchers + fix generators ---
+
+_FIX_PATTERNS: list[tuple[str, re.Pattern, Callable[[str, re.Match], str | None]]] = []
+
+
+def _register_fix(name: str, pattern: str):
+    """Decorator to register an auto-fix pattern."""
+    compiled = re.compile(pattern, re.IGNORECASE)
+    def decorator(func: Callable[[str, re.Match], str | None]):
+        _FIX_PATTERNS.append((name, compiled, func))
+        return func
+    return decorator
+
+
+@_register_fix("mkdir_exists", r"mkdir:\s.*(?:File exists|cannot create directory).*['\"]?([^'\"\n]+)['\"]?")
+def _fix_mkdir_exists(cmd: str, match: re.Match) -> str | None:
+    """mkdir fails with 'File exists' -> retry with mkdir -p."""
+    if "mkdir" in cmd and "-p" not in cmd:
+        return cmd.replace("mkdir ", "mkdir -p ", 1)
+    return None
+
+
+@_register_fix("missing_parent_dir", r"(?:cp|mv|install):\s.*(?:No such file or directory|cannot (?:stat|create|move)).*['\"]?([^'\"\n]+)['\"]?")
+def _fix_missing_parent(cmd: str, match: re.Match) -> str | None:
+    """cp/mv/install fails with 'No such file or directory' -> create parent dirs first."""
+    # Extract the destination path (last argument)
+    parts = cmd.strip().split()
+    if len(parts) < 3:
+        return None
+    dest = parts[-1]
+    # If dest looks like a path (has a /), create its parent
+    if "/" in dest:
+        parent = str(Path(dest).parent)
+        return f"mkdir -p {parent} && {cmd}"
+    return None
+
+
+@_register_fix("permission_denied", r"(?:Permission denied|EACCES|Operation not permitted).*['\"]?([^'\"\n]*)['\"]?")
+def _fix_permission_denied(cmd: str, match: re.Match) -> str | None:
+    """Permission denied -> try chmod +x or sudo depending on the command."""
+    # For file copy/move operations, try making the target writable
+    parts = cmd.strip().split()
+    if not parts:
+        return None
+    verb = parts[0]
+    if verb in ("cp", "mv", "install", "ln") and len(parts) >= 3:
+        dest = parts[-1]
+        if Path(dest).exists():
+            return f"chmod -R u+w {dest} 2>/dev/null; {cmd}"
+        parent = str(Path(dest).parent)
+        return f"chmod -R u+w {parent} 2>/dev/null; {cmd}"
+    # For execution failures, try chmod +x
+    if verb in ("./", "sh", "bash") or verb.startswith("./") or verb.startswith("/"):
+        target = parts[0]
+        return f"chmod +x {target} && {cmd}"
+    return None
+
+
+@_register_fix("dir_not_empty", r"(?:mv|rm):\s.*(?:Directory not empty|cannot (?:move|remove)).*['\"]?([^'\"\n]+)['\"]?")
+def _fix_dir_not_empty(cmd: str, match: re.Match) -> str | None:
+    """mv fails with 'Directory not empty' -> use cp -af then rm."""
+    parts = cmd.strip().split()
+    if len(parts) >= 3 and parts[0] == "mv":
+        # Extract source and dest, handling flags
+        args = [p for p in parts[1:] if not p.startswith("-")]
+        if len(args) >= 2:
+            src, dst = args[-2], args[-1]
+            return f"cp -af {src} {dst} && rm -rf {src}"
+    return None
+
+
+@_register_fix("device_busy", r"(?:Device or resource busy|EBUSY)")
+def _fix_device_busy(cmd: str, match: re.Match) -> str | None:
+    """Device busy on umount/rm -> lazy umount or wait-retry."""
+    parts = cmd.strip().split()
+    if parts and parts[0] == "umount":
+        if "-l" not in parts:
+            return cmd.replace("umount ", "umount -l ", 1)
+    return None
+
+
+@_register_fix("symlink_exists", r"ln:\s.*(?:File exists|failed to create symbolic link)")
+def _fix_symlink_exists(cmd: str, match: re.Match) -> str | None:
+    """ln fails with 'File exists' -> retry with ln -sf."""
+    if "ln" in cmd and "-sf" not in cmd and "-f" not in cmd:
+        return cmd.replace("ln -s ", "ln -sf ", 1).replace("ln ", "ln -sf ", 1)
+    return None
+
+
+def _try_auto_fix(
+    cmd: str,
+    stderr: str,
+    exit_code: int,
+    timeout: int,
+    workdir: str | None,
+) -> ToolResult | None:
+    """Attempt to auto-fix a failed command. Returns new ToolResult or None.
+
+    Called by execute_command() when a command fails. Checks stderr against
+    known error patterns, generates a fixed command, and runs it once.
+    Returns None if no fix was applicable or auto-fix is disabled/exhausted.
+    """
+    global _auto_fix_count
+
+    if not _self_heal_enabled:
+        return None
+    if _auto_fix_count >= _max_auto_fixes:
+        logger.debug("Auto-fix budget exhausted (%d/%d)", _auto_fix_count, _max_auto_fixes)
+        return None
+
+    for pattern_name, pattern_re, fix_func in _FIX_PATTERNS:
+        match = pattern_re.search(stderr)
+        if not match:
+            continue
+
+        fixed_cmd = fix_func(cmd, match)
+        if not fixed_cmd or fixed_cmd == cmd:
+            continue
+
+        # Execute the fixed command
+        logger.info("AUTO-FIX [%s]: %s -> %s", pattern_name, cmd[:80], fixed_cmd[:80])
+        _auto_fix_count += 1
+
+        fix_record = AutoFixResult(
+            original_cmd=cmd,
+            fixed_cmd=fixed_cmd,
+            error_pattern=pattern_name,
+            strategy=f"{pattern_name}: rewritten command",
+        )
+
+        try:
+            result = subprocess.run(
+                fixed_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=workdir,
+                env={**os.environ, "TERM": "dumb", "LANG": "C"},
+            )
+
+            fix_record.success = result.returncode == 0
+            _auto_fix_history.append(fix_record)
+
+            # Notify TUI
+            if _on_auto_fix:
+                _on_auto_fix(fix_record)
+
+            stdout = result.stdout or ""
+            stderr_new = result.stderr or ""
+
+            output_parts = []
+            output_parts.append(
+                f"[AUTO-FIXED] Original command failed ({pattern_name}). "
+                f"Retried with: {fixed_cmd}"
+            )
+            if stdout:
+                output_parts.append(f"[stdout]\n{_truncate(stdout)}")
+            if stderr_new:
+                output_parts.append(f"[stderr]\n{_truncate(stderr_new)}")
+            output_parts.append(f"[exit_code: {result.returncode}]")
+
+            return ToolResult(
+                tool_call_id="",
+                output="\n".join(output_parts),
+                success=result.returncode == 0,
+                duration=0.0,
+            )
+
+        except subprocess.TimeoutExpired:
+            fix_record.success = False
+            _auto_fix_history.append(fix_record)
+            logger.warning("Auto-fix command also timed out: %s", fixed_cmd[:80])
+            return None
+        except Exception as exc:
+            fix_record.success = False
+            _auto_fix_history.append(fix_record)
+            logger.warning("Auto-fix command failed: %s -- %s", fixed_cmd[:80], exc)
+            return None
+
+    return None  # No pattern matched
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
@@ -79,6 +318,10 @@ def execute_command(cmd: str, timeout: int = 120, workdir: str | None = None) ->
 
         if not success:
             logger.warning("Command failed (exit %d): %s", exit_code, cmd[:100])
+            # --- Self-Healing Layer 1: try auto-fix before returning ---
+            auto_result = _try_auto_fix(cmd, stderr, exit_code, timeout, workdir)
+            if auto_result is not None:
+                return auto_result
 
         return ToolResult(tool_call_id="", output=output, success=success)
 

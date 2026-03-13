@@ -8,16 +8,19 @@ retry logic with backoff for failed approaches.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
 import httpx
 
-from iotghost.prompts import SYSTEM_PROMPT
+from iotghost.prompts import SELF_HEAL_PROMPT, SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +94,181 @@ class AgentState:
     @property
     def elapsed(self) -> float:
         return time.time() - self.start_time
+
+
+# ---------------------------------------------------------------------------
+# Self-Healing Layer 2 -- Error Tracker + Stuck Detection
+# ---------------------------------------------------------------------------
+
+# Error categories for classification
+ERROR_CATEGORIES = {
+    "permission": re.compile(r"Permission denied|EACCES|Operation not permitted", re.I),
+    "missing_file": re.compile(r"No such file or directory|ENOENT|cannot stat", re.I),
+    "exists": re.compile(r"File exists|EEXIST|already exists|cannot create", re.I),
+    "timeout": re.compile(r"TIMEOUT|timed? ?out|deadline exceeded", re.I),
+    "crash": re.compile(r"Segmentation fault|SIGSEGV|core dump|SIGABRT|killed", re.I),
+    "disk": re.compile(r"No space left|ENOSPC|Disk quota exceeded", re.I),
+    "network": re.compile(r"Connection refused|ECONNREFUSED|Network unreachable", re.I),
+    "busy": re.compile(r"Device or resource busy|EBUSY", re.I),
+}
+
+
+@dataclass
+class ErrorRecord:
+    """Single recorded error from a tool execution."""
+    iteration: int
+    command: str
+    error_text: str
+    category: str       # key from ERROR_CATEGORIES or 'unknown'
+    cmd_hash: str       # hash of command for repetition detection
+    timestamp: float = field(default_factory=time.time)
+
+
+class ErrorTracker:
+    """Tracks command failures with pattern detection for self-healing.
+
+    Detects three kinds of stuck states:
+    - 'repeater': same exact command failing repeatedly (3+ times)
+    - 'looper': cycling between 2-3 failing commands
+    - 'stalled': 5+ consecutive failures regardless of command
+
+    When stuck is detected, the agent injects a corrective prompt
+    forcing a different approach.
+    """
+
+    HISTORY_SIZE = 50
+    REPEAT_THRESHOLD = 3    # same command N times = repeater
+    LOOP_WINDOW = 8         # look at last N commands for loop detection
+    STALL_THRESHOLD = 5     # N consecutive failures = stalled
+
+    def __init__(self) -> None:
+        self.error_history: deque[ErrorRecord] = deque(maxlen=self.HISTORY_SIZE)
+        self.cmd_hashes: deque[str] = deque(maxlen=self.LOOP_WINDOW * 2)
+        self.consecutive_failures: int = 0
+        self.total_failures: int = 0
+        self.errors_by_category: dict[str, int] = {}
+        self._corrective_injections: int = 0
+
+    def reset(self) -> None:
+        """Reset all tracking (called at phase start)."""
+        self.error_history.clear()
+        self.cmd_hashes.clear()
+        self.consecutive_failures = 0
+        self.total_failures = 0
+        self.errors_by_category.clear()
+        self._corrective_injections = 0
+
+    def record_success(self) -> None:
+        """Record a successful command -- resets consecutive failure count."""
+        self.consecutive_failures = 0
+
+    def record_error(self, iteration: int, command: str, error_text: str) -> None:
+        """Record a command failure and classify it."""
+        category = self._classify(error_text)
+        cmd_hash = hashlib.md5(command.strip().encode()).hexdigest()[:12]
+
+        record = ErrorRecord(
+            iteration=iteration,
+            command=command[:200],
+            error_text=error_text[:500],
+            category=category,
+            cmd_hash=cmd_hash,
+        )
+        self.error_history.append(record)
+        self.cmd_hashes.append(cmd_hash)
+        self.consecutive_failures += 1
+        self.total_failures += 1
+        self.errors_by_category[category] = self.errors_by_category.get(category, 0) + 1
+
+        logger.debug(
+            "ErrorTracker: %s (cat=%s, consecutive=%d, total=%d)",
+            command[:60], category, self.consecutive_failures, self.total_failures,
+        )
+
+    def detect_stuck(self) -> str | None:
+        """Detect if the agent is stuck. Returns stuck type or None.
+
+        Returns:
+            'repeater' -- same command failing 3+ times
+            'looper'   -- cycling between 2-3 failing commands
+            'stalled'  -- 5+ consecutive failures of any kind
+            None       -- not stuck
+        """
+        if self.consecutive_failures < 2:
+            return None
+
+        # Check repeater: last N hashes are all the same
+        if len(self.cmd_hashes) >= self.REPEAT_THRESHOLD:
+            recent = list(self.cmd_hashes)[-self.REPEAT_THRESHOLD:]
+            if len(set(recent)) == 1:
+                return "repeater"
+
+        # Check looper: small set of hashes cycling in the window
+        if len(self.cmd_hashes) >= self.LOOP_WINDOW:
+            window = list(self.cmd_hashes)[-self.LOOP_WINDOW:]
+            unique = set(window)
+            if len(unique) <= 3 and len(window) >= self.LOOP_WINDOW:
+                return "looper"
+
+        # Check stalled: too many consecutive failures
+        if self.consecutive_failures >= self.STALL_THRESHOLD:
+            return "stalled"
+
+        return None
+
+    def build_diagnostic_context(self) -> str:
+        """Build a structured error summary for corrective prompt injection.
+
+        Returns a formatted string with:
+        - Error category breakdown
+        - Last N unique failed commands with their errors
+        - Stuck type diagnosis
+        """
+        stuck_type = self.detect_stuck()
+        lines = [
+            "=== SELF-HEALING DIAGNOSTIC ===",
+            f"Consecutive failures: {self.consecutive_failures}",
+            f"Total failures this phase: {self.total_failures}",
+            f"Stuck type: {stuck_type or 'none'}",
+            "",
+            "Error breakdown by category:",
+        ]
+
+        for cat, count in sorted(self.errors_by_category.items(), key=lambda x: -x[1]):
+            lines.append(f"  {cat}: {count}")
+
+        # Show last 5 unique errors
+        seen_hashes: set[str] = set()
+        unique_errors: list[ErrorRecord] = []
+        for rec in reversed(self.error_history):
+            if rec.cmd_hash not in seen_hashes:
+                seen_hashes.add(rec.cmd_hash)
+                unique_errors.append(rec)
+            if len(unique_errors) >= 5:
+                break
+
+        if unique_errors:
+            lines.append("")
+            lines.append("Recent unique failures:")
+            for rec in unique_errors:
+                lines.append(f"  [{rec.category}] $ {rec.command}")
+                # Show first line of error
+                first_line = rec.error_text.strip().split("\n")[0][:120]
+                lines.append(f"    -> {first_line}")
+
+        lines.append("=== END DIAGNOSTIC ===")
+        return "\n".join(lines)
+
+    def _classify(self, error_text: str) -> str:
+        """Classify error text into a category."""
+        for cat, pattern in ERROR_CATEGORIES.items():
+            if pattern.search(error_text):
+                return cat
+        return "unknown"
+
+    @property
+    def has_errors(self) -> bool:
+        return self.total_failures > 0
 
 
 # ---------------------------------------------------------------------------
@@ -306,16 +484,21 @@ class ShellAgent:
         on_tool_call: Callable[[ToolCall], None] | None = None,
         on_tool_result: Callable[[ToolResult], None] | None = None,
         on_phase_change: Callable[[str, str], None] | None = None,
+        on_self_heal: Callable[[str, str, bool], None] | None = None,
+        self_heal_enabled: bool = True,
     ) -> None:
         self.config = config
         self.state = AgentState()
         self.client = OllamaClient(config)
+        self.error_tracker = ErrorTracker()
+        self._self_heal_enabled = self_heal_enabled
 
         # Callbacks for TUI/logging
         self._on_message = on_message
         self._on_tool_call = on_tool_call
         self._on_tool_result = on_tool_result
         self._on_phase_change = on_phase_change
+        self._on_self_heal = on_self_heal
 
     def initialize(self, system_prompt: str | None = None) -> None:
         """Set up the agent with its system prompt."""
@@ -334,6 +517,10 @@ class ShellAgent:
 
         if self._on_phase_change and old_phase != self.state.phase:
             self._on_phase_change(old_phase, self.state.phase)
+
+        # Reset error tracker on phase change for fresh tracking
+        if old_phase != self.state.phase:
+            self.error_tracker.reset()
 
         msg = Message(role=Role.USER, content=phase_prompt)
         self.state.messages.append(msg)
@@ -387,6 +574,18 @@ class ShellAgent:
                 if self._on_tool_result:
                     self._on_tool_result(result)
 
+                # --- Self-Healing Layer 2: track errors ---
+                if result.success:
+                    self.error_tracker.record_success()
+                else:
+                    # Extract the command from tool call args
+                    cmd_str = tc.arguments.get("cmd", tc.arguments.get("command", tc.name))
+                    self.error_tracker.record_error(
+                        iteration=self.state.iteration,
+                        command=str(cmd_str),
+                        error_text=result.output,
+                    )
+
                 # Feed result back to LLM
                 tool_msg = Message(
                     role=Role.TOOL,
@@ -395,11 +594,77 @@ class ShellAgent:
                 )
                 self.state.messages.append(tool_msg)
 
+            # --- Self-Healing: inject corrective prompt if stuck ---
+            if self._self_heal_enabled:
+                stuck_type = self.error_tracker.detect_stuck()
+                if stuck_type:
+                    self._inject_corrective_prompt(stuck_type)
+
             # --- Context window management ---
             self._trim_context_if_needed()
 
         logger.warning("Agent hit iteration limit (%d)", limit)
         return f"[IoTGhost] Reached maximum iterations ({limit}). Last phase: {self.state.phase}"
+
+    def _inject_corrective_prompt(self, stuck_type: str) -> None:
+        """Inject a corrective system message when stuck is detected.
+
+        Forces the LLM to reassess its approach by providing diagnostic
+        context and explicit instructions to try something different.
+        """
+        self.error_tracker._corrective_injections += 1
+        diag = self.error_tracker.build_diagnostic_context()
+
+        strategies = {
+            "repeater": (
+                "You are REPEATING the exact same failing command. STOP. "
+                "The command will not work no matter how many times you retry it. "
+                "You MUST use a completely different approach. "
+                "Use idempotent alternatives: mkdir -p, cp -af, ln -sf, "
+                "test -e before operating, or skip this step entirely."
+            ),
+            "looper": (
+                "You are LOOPING between the same 2-3 failing commands. "
+                "This cycle will not resolve itself. Step back and re-think. "
+                "What is the ROOT CAUSE? Are you missing a prerequisite step? "
+                "Is the path wrong? Is the filesystem read-only? "
+                "List what you know, then try a fundamentally different approach."
+            ),
+            "stalled": (
+                "You have had {n} consecutive command failures. Something is "
+                "fundamentally wrong with your current approach. "
+                "STOP executing commands and DIAGNOSE: "
+                "1) ls -la the target directories to verify they exist, "
+                "2) Check filesystem mount status with 'mount' and 'df -h', "
+                "3) Verify the rootfs was extracted correctly, "
+                "4) Then formulate a new plan before running any more commands."
+            ).format(n=self.error_tracker.consecutive_failures),
+        }
+
+        strategy = strategies.get(stuck_type, strategies["stalled"])
+
+        # For severe cases (3+ injections), use the full expert prompt
+        if self.error_tracker._corrective_injections >= 3:
+            corrective = SELF_HEAL_PROMPT.format(
+                diagnostic_context=diag,
+            )
+        else:
+            corrective = f"[SELF-HEALING] {strategy}\n\n{diag}"
+
+        logger.warning(
+            "Self-healing triggered: %s (injection #%d)",
+            stuck_type, self.error_tracker._corrective_injections,
+        )
+
+        msg = Message(role=Role.USER, content=corrective)
+        self.state.messages.append(msg)
+        if self._on_message:
+            self._on_message(msg)
+        if self._on_self_heal:
+            self._on_self_heal(self.state.phase, stuck_type, True)
+
+        # Reset consecutive counter so we don't immediately re-trigger
+        self.error_tracker.consecutive_failures = 0
 
     def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
         """Execute a single tool call and return the result."""
@@ -514,6 +779,10 @@ class ShellAgent:
             "context_vars": dict(self.state.context_vars),
             "errors_seen": len(self.state.errors_seen),
             "fixes_attempted": len(self.state.attempted_fixes),
+            # Self-healing stats
+            "self_heal_injections": self.error_tracker._corrective_injections,
+            "tracked_failures": self.error_tracker.total_failures,
+            "errors_by_category": dict(self.error_tracker.errors_by_category),
         }
 
     def shutdown(self) -> None:

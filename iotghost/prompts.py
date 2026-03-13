@@ -544,3 +544,191 @@ KERNEL_APPEND_TEMPLATES: dict[str, str] = {
     "x86": "root=/dev/sda1 console=ttyS0 rw rootwait",
     "x86_64": "root=/dev/sda1 console=ttyS0 rw rootwait",
 }
+
+# ---------------------------------------------------------------------------
+# Self-healing prompts -- injected by ErrorTracker when agent is stuck
+# ---------------------------------------------------------------------------
+
+SELF_HEAL_PROMPT = """\
+## SELF-HEALING MODE ACTIVATED
+
+You are repeating failed commands or stuck in a loop. STOP and reassess.
+
+### Error Diagnostic
+{diagnostic_context}
+
+### MANDATORY RULES
+1. **DO NOT repeat any command listed above** -- they already failed.
+2. **Analyze the root cause** -- read the error messages carefully:
+   - "File exists" -> use `mkdir -p`, `cp -af`, `ln -sf` (idempotent variants)
+   - "No such file or directory" -> verify the path exists: `ls -la $(dirname <path>)`
+   - "Permission denied" -> check ownership: `ls -la <path>`, fix with `chmod`/`chown`
+   - "Device or resource busy" -> find what holds it: `lsof +f -- <path>` or `fuser -vm <path>`
+   - "Segmentation fault" / "Illegal instruction" -> architecture mismatch or missing libs
+   - "Kernel panic" -> wrong kernel, missing rootfs drivers, or bad init=
+3. **Try a fundamentally different approach**, not a minor variation:
+   - If `cp` fails, try `rsync` or `tar cf - | tar xf -`
+   - If `mount` fails with one FS type, probe with `file` and `blkid` first
+   - If QEMU crashes, verify kernel matches rootfs arch: `file <kernel>` vs `file <rootfs-binary>`
+4. **Use diagnostic commands** before attempting fixes:
+   - `dmesg | tail -30` for kernel messages
+   - `strace -f <cmd> 2>&1 | tail -40` to trace syscall failures
+   - `readelf -h <binary>` to confirm architecture
+   - `ldd <binary>` or `readelf -d <binary>` for missing libraries
+5. **If 3+ fixes fail for the same issue**, skip it and continue to the next phase.
+   Not every component needs to work for the firmware to boot.
+
+### Common Root Causes You May Be Missing
+- NVRAM helper not intercepting calls -> check `LD_PRELOAD` path is absolute and lib exists
+- Wrong QEMU machine type -> `malta` for MIPS, `virt` for ARM; verify with kernel config
+- Kernel/userspace ABI mismatch -> kernel too old/new for the firmware's glibc
+- SquashFS version mismatch -> host `unsquashfs` may not support firmware's squashfs version
+- Hardcoded /dev paths -> firmware expects /dev/mtdblock0 etc. that don't exist in QEMU
+"""
+
+
+KERNEL_BUILD_PROMPT = """\
+## KERNEL BUILD REQUIRED
+
+No pre-built kernel matches this firmware's architecture/requirements. Build one using Buildroot.
+
+### Target Architecture: {arch}
+### Detected Requirements: {requirements}
+
+### Step-by-Step Kernel Build
+
+1. **Clone Buildroot** (if not already present):
+   ```
+   git clone --depth 1 https://github.com/buildroot/buildroot.git /tmp/buildroot
+   cd /tmp/buildroot
+   ```
+
+2. **Select the right defconfig**:
+   - MIPS (little-endian): `make qemu_mipsel_malta_defconfig`
+   - MIPS (big-endian): `make qemu_mips32r6_malta_defconfig`
+   - ARM (32-bit): `make qemu_arm_vexpress_defconfig`
+   - ARM64: `make qemu_aarch64_virt_defconfig`
+   - x86: `make qemu_x86_defconfig`
+   - x86_64: `make qemu_x86_64_defconfig`
+
+3. **Enable required kernel modules** (use `make linux-menuconfig` or patch .config):
+   Essential modules for IoT firmware emulation:
+   - **Filesystem**: SquashFS (CONFIG_SQUASHFS=y), ext4 (CONFIG_EXT4_FS=y),
+     JFFS2 (CONFIG_JFFS2_FS=y), CRAMFS (CONFIG_CRAMFS=y)
+   - **9P/VirtFS**: CONFIG_NET_9P=y, CONFIG_9P_FS=y (for host directory sharing)
+   - **NFS**: CONFIG_NFS_FS=y, CONFIG_NFS_V3=y (alternative rootfs mount)
+   - **MTD**: CONFIG_MTD=y, CONFIG_MTD_BLOCK=y, CONFIG_MTD_RAM=y (flash emulation)
+   - **Block**: CONFIG_BLK_DEV_LOOP=y (loop mounts)
+   - **Device**: CONFIG_DEVTMPFS=y, CONFIG_DEVTMPFS_MOUNT=y (auto-populate /dev)
+   - **Network**: CONFIG_E1000=y (MIPS/x86), CONFIG_VIRTIO_NET=y (ARM)
+   - **MIPS-specific**: CONFIG_CPU_MIPS32_R2=y, CONFIG_CPU_HAS_PREFETCH=y
+
+4. **Build**:
+   ```
+   make -j$(nproc)
+   ```
+   Output kernel: `output/images/vmlinux` (MIPS) or `output/images/zImage` (ARM)
+
+5. **Verify the kernel**:
+   ```
+   file output/images/vmlinux
+   ```
+   Must match firmware architecture (MIPS/ARM/etc.)
+
+### IMPORTANT NOTES
+- Buildroot downloads toolchain + compiles everything -- allow 10-15 minutes
+- If `make` fails on host deps, install: `sudo apt-get install -y build-essential libncurses-dev rsync unzip bc`
+- For MIPS Malta, the kernel MUST support the GT-64120 PCI bridge (enabled by default in Malta defconfig)
+- Kernel version ~4.x-5.x works best for most consumer IoT firmware
+"""
+
+
+BINARY_FIX_PROMPT = """\
+## BINARY DIAGNOSIS & REPAIR
+
+A firmware binary is crashing or failing to execute. Systematically diagnose and fix.
+
+### Target Binary: {binary_path}
+### Observed Error: {error_msg}
+
+### Diagnosis Procedure (follow in order)
+
+1. **Verify architecture compatibility**:
+   ```
+   file {binary_path}
+   readelf -h {binary_path} | grep -E 'Class|Machine|Flags'
+   ```
+   Compare against the emulated CPU. ARM binary on MIPS QEMU = guaranteed crash.
+
+2. **Check for missing shared libraries**:
+   ```
+   readelf -d {binary_path} | grep NEEDED
+   ```
+   Then verify each library exists in the firmware rootfs:
+   ```
+   for lib in $(readelf -d {binary_path} | grep NEEDED | awk '{{print $5}}' | tr -d '[]'); do
+     find /path/to/rootfs -name "$lib" 2>/dev/null || echo "MISSING: $lib"
+   done
+   ```
+
+3. **Trace execution to pinpoint failure**:
+   ```
+   chroot /path/to/rootfs /usr/bin/qemu-{arch}-static -strace {binary_path} 2>&1 | tail -50
+   ```
+   Or if running in full system QEMU:
+   ```
+   strace -f -e trace=open,openat,execve {binary_path} 2>&1 | tail -50
+   ```
+   Look for: ENOENT (missing files), EACCES (permissions), SIGSEGV (crash)
+
+4. **Check for unresolved symbols**:
+   ```
+   objdump -T {binary_path} | grep 'UND' | head -20
+   ```
+   Cross-reference with available libraries in rootfs.
+
+### Repair Strategies
+
+**Missing shared library** -> Cross-compile or provide a stub:
+```
+# Option A: Find the library from the firmware itself
+find /path/to/rootfs -name '*.so*' | xargs grep -l '<function_name>' 2>/dev/null
+
+# Option B: Create an LD_PRELOAD stub for missing functions
+cat > /tmp/stub.c << 'STUB'
+// Stub for missing functions -- returns success/zero
+void missing_func(void) {{ return; }}
+int missing_func_ret(void) {{ return 0; }}
+STUB
+# Cross-compile for target arch:
+mipsel-linux-gnu-gcc -shared -o /tmp/libstub.so /tmp/stub.c
+```
+
+**NVRAM dependency** -> Ensure libnvram.so is preloaded:
+```
+ls -la /path/to/rootfs/lib/libnvram*.so
+LD_PRELOAD=/absolute/path/to/libnvram.so {binary_path}
+```
+
+**Hardcoded device paths** -> Create necessary device nodes:
+```
+# Common IoT device nodes
+mknod /path/to/rootfs/dev/mtdblock0 b 31 0
+mknod /path/to/rootfs/dev/mtdblock1 b 31 1
+mknod /path/to/rootfs/dev/mem c 1 1
+mknod /path/to/rootfs/dev/null c 1 3
+mknod /path/to/rootfs/dev/zero c 1 5
+mknod /path/to/rootfs/dev/urandom c 1 9
+```
+
+**Illegal instruction (SIGILL)** -> CPU feature mismatch:
+- Check if binary uses FPU: `readelf -h {binary_path} | grep Flags`
+- MIPS 'nan2008' binaries need `-cpu mips32r6-generic` in QEMU
+- Try `qemu-system-mips -cpu help` to list available CPU models
+- Fallback: use `qemu-{arch}-static` (user-mode) to isolate the issue
+
+### When To Give Up On A Binary
+- If it's a hardware-specific daemon (e.g., wifi driver manager) -- skip it
+- If it requires kernel modules that can't be loaded -- note it and move on
+- Focus on httpd/web server binaries -- those are the primary targets
+"""

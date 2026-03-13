@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -454,37 +455,81 @@ class QemuManager:
 # Rootfs image creation utilities
 # ---------------------------------------------------------------------------
 
-def create_rootfs_image(
-    rootfs_dir: str,
-    output_path: str,
-    size_mb: int = 256,
-    fs_type: str = "ext4",
-) -> str:
-    """Create a mountable disk image from an extracted rootfs directory.
+def _has_tool(name: str) -> bool:
+    """Check if a command-line tool is available on PATH."""
+    return shutil.which(name) is not None
 
-    QEMU needs a disk image, not a directory. This creates an ext4 image,
-    mounts it, copies the rootfs contents, and unmounts.
 
-    Returns the path to the created image.
-    """
-    logger.info("Creating %dMB %s image from %s", size_mb, fs_type, rootfs_dir)
+def _create_image_genext2fs(
+    rootfs_dir: str, output_path: str, size_mb: int,
+) -> None:
+    """Create ext2 image with genext2fs (no root required)."""
+    block_size = 1024
+    num_blocks = size_mb * 1024  # 1KB blocks
+    subprocess.run(
+        [
+            "genext2fs", "-b", str(num_blocks),
+            "-d", rootfs_dir, output_path,
+        ],
+        check=True, capture_output=True,
+    )
+    # Optionally upgrade to ext4 if tune2fs is available
+    if _has_tool("tune2fs"):
+        subprocess.run(
+            ["tune2fs", "-O", "extents,uninit_bg,dir_index,has_journal", output_path],
+            capture_output=True,  # best-effort, ext2 still works fine
+        )
+    logger.info("Created rootfs image via genext2fs (no root needed)")
 
-    # Create empty image
+
+def _create_image_debugfs(
+    rootfs_dir: str, output_path: str, size_mb: int, fs_type: str,
+) -> None:
+    """Create image with dd+mkfs then populate via debugfs (no root required)."""
     subprocess.run(
         ["dd", "if=/dev/zero", f"of={output_path}", "bs=1M", f"count={size_mb}"],
         check=True, capture_output=True,
     )
-
-    # Create filesystem
     subprocess.run(
         [f"mkfs.{fs_type}", "-F", output_path],
         check=True, capture_output=True,
     )
+    # Use debugfs to copy directory tree into image without mounting
+    # Build a command script for debugfs
+    rootfs = Path(rootfs_dir)
+    cmds: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(rootfs):
+        rel = os.path.relpath(dirpath, rootfs)
+        if rel != ".":
+            cmds.append(f"mkdir {rel}")
+        for fname in filenames:
+            src = os.path.join(dirpath, fname)
+            dest = os.path.join(rel, fname) if rel != "." else fname
+            # debugfs 'write' command: write <local_file> <ext_path>
+            cmds.append(f"write {src} {dest}")
+    cmd_script = "\n".join(cmds)
+    subprocess.run(
+        ["debugfs", "-w", "-f", "/dev/stdin", output_path],
+        input=cmd_script.encode(),
+        check=True, capture_output=True,
+    )
+    logger.info("Created rootfs image via debugfs (no root needed)")
 
-    # Mount and copy
+
+def _create_image_mount(
+    rootfs_dir: str, output_path: str, size_mb: int, fs_type: str,
+) -> None:
+    """Create image with mount -o loop (requires root/sudo)."""
+    subprocess.run(
+        ["dd", "if=/dev/zero", f"of={output_path}", "bs=1M", f"count={size_mb}"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        [f"mkfs.{fs_type}", "-F", output_path],
+        check=True, capture_output=True,
+    )
     mount_point = f"{output_path}.mount"
     os.makedirs(mount_point, exist_ok=True)
-
     try:
         subprocess.run(
             ["mount", "-o", "loop", output_path, mount_point],
@@ -496,8 +541,75 @@ def create_rootfs_image(
         )
     finally:
         subprocess.run(["umount", mount_point], capture_output=True)
-        os.rmdir(mount_point)
+        if os.path.isdir(mount_point):
+            shutil.rmtree(mount_point, ignore_errors=True)
+    logger.info("Created rootfs image via mount (required root)")
 
+
+def create_rootfs_image(
+    rootfs_dir: str,
+    output_path: str,
+    size_mb: int = 256,
+    fs_type: str = "ext4",
+) -> str:
+    """Create a mountable disk image from an extracted rootfs directory.
+
+    QEMU needs a disk image, not a directory. Uses a fallback chain:
+    1. genext2fs -- no root needed, widely available
+    2. debugfs   -- no root needed, part of e2fsprogs
+    3. mount -o loop -- requires root/sudo (legacy fallback)
+
+    Returns the path to the created image.
+    """
+    logger.info("Creating %dMB %s image from %s", size_mb, fs_type, rootfs_dir)
+
+    errors: list[str] = []
+
+    # --- Strategy 1: genext2fs (preferred, no root) ---
+    if _has_tool("genext2fs"):
+        try:
+            _create_image_genext2fs(rootfs_dir, output_path, size_mb)
+            return _finalise_image(output_path)
+        except subprocess.CalledProcessError as exc:
+            errors.append(f"genext2fs failed: {exc}")
+            logger.warning("genext2fs failed, trying next method: %s", exc)
+    else:
+        errors.append("genext2fs not installed")
+
+    # --- Strategy 2: debugfs (no root, part of e2fsprogs) ---
+    if _has_tool("debugfs") and _has_tool(f"mkfs.{fs_type}"):
+        try:
+            _create_image_debugfs(rootfs_dir, output_path, size_mb, fs_type)
+            return _finalise_image(output_path)
+        except subprocess.CalledProcessError as exc:
+            errors.append(f"debugfs failed: {exc}")
+            logger.warning("debugfs failed, trying next method: %s", exc)
+    else:
+        errors.append("debugfs or mkfs not installed")
+
+    # --- Strategy 3: mount -o loop (requires root) ---
+    if os.geteuid() == 0 or _has_tool("sudo"):
+        try:
+            _create_image_mount(rootfs_dir, output_path, size_mb, fs_type)
+            return _finalise_image(output_path)
+        except subprocess.CalledProcessError as exc:
+            errors.append(f"mount failed (exit {exc.returncode}): {exc.stderr[:200] if exc.stderr else ''}")
+            logger.warning("mount -o loop failed: %s", exc)
+        except PermissionError as exc:
+            errors.append(f"mount permission denied: {exc}")
+    else:
+        errors.append("mount -o loop requires root and sudo not available")
+
+    # --- All strategies failed ---
+    raise RuntimeError(
+        f"Could not create rootfs image. Tried {len(errors)} methods:\n"
+        + "\n".join(f"  {i+1}. {e}" for i, e in enumerate(errors))
+        + "\n\nFix: install genext2fs (apt install genext2fs) or run with sudo."
+    )
+
+
+def _finalise_image(output_path: str) -> str:
+    """Log final image size and return path."""
     size_actual = os.path.getsize(output_path)
     logger.info("Created rootfs image: %s (%d bytes)", output_path, size_actual)
     return output_path

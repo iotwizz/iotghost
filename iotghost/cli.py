@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 import click
 from rich.console import Console
@@ -206,8 +208,10 @@ def run(
     # Build pipeline with callbacks
     pipeline = EmulationPipeline(
         config=pipeline_config,
-        on_phase_change=tui.on_phase_change if tui else None,
+        on_phase_change=tui.on_phase_change if tui else _plain_phase_change,
         on_agent_message=tui.on_agent_message if tui else _plain_message,
+        on_tool_call=tui.on_tool_call if tui else _plain_tool_call,
+        on_tool_result=tui.on_tool_result if tui else _plain_tool_result,
         on_status_update=tui.on_status_update if tui else None,
     )
 
@@ -387,12 +391,90 @@ def _print_banner(firmware: str, model: str, arch: str, network: str) -> None:
     console.print()
 
 
+# ---------------------------------------------------------------------------
+# Plain-mode (non-TUI) live progress callbacks
+# ---------------------------------------------------------------------------
+
+_plain_state: dict[str, Any] = {
+    "phase": "init",
+    "cmd_count": 0,
+    "start_time": 0.0,
+}
+
+
+def _plain_phase_change(old_phase: Any, new_phase: Any) -> None:
+    """Show phase transitions in non-TUI mode."""
+    phase_str = new_phase.value if hasattr(new_phase, "value") else str(new_phase)
+    _plain_state["phase"] = phase_str
+    _plain_state["cmd_count"] = 0
+    _plain_state["start_time"] = time.time()
+    console.print(f"\n[bold cyan]{'='*50}[/]")
+    console.print(f"[bold cyan]  Phase: {phase_str.upper()}[/]")
+    console.print(f"[bold cyan]{'='*50}[/]")
+
+
+def _plain_tool_call(tool_call: Any) -> None:
+    """Show live command execution in non-TUI mode."""
+    _plain_state["cmd_count"] += 1
+    elapsed = time.time() - _plain_state.get("start_time", time.time())
+    phase = _plain_state["phase"]
+    count = _plain_state["cmd_count"]
+
+    # Build compact argument preview
+    args_preview = ""
+    if hasattr(tool_call, "arguments"):
+        for k, v in tool_call.arguments.items():
+            val_str = str(v)
+            if len(val_str) > 60:
+                val_str = val_str[:57] + "..."
+            args_preview += f" {k}={val_str}"
+            if len(args_preview) > 80:
+                args_preview = args_preview[:77] + "..."
+                break
+
+    name = tool_call.name if hasattr(tool_call, "name") else str(tool_call)
+    console.print(
+        f"  [yellow]>[/] [dim]{phase}[/] #{count} "
+        f"[bold yellow]{name}[/][dim]{args_preview}[/] "
+        f"[dim]({elapsed:.0f}s)[/]"
+    )
+
+
+def _plain_tool_result(result: Any) -> None:
+    """Show compact command result in non-TUI mode."""
+    if not hasattr(result, "success"):
+        return
+
+    status_icon = "[green]OK[/]" if result.success else "[red]FAIL[/]"
+    duration = f" {result.duration:.1f}s" if hasattr(result, "duration") and result.duration else ""
+
+    # Show first meaningful line of output, truncated
+    output = getattr(result, "output", "")
+    preview = ""
+    if output:
+        for line in output.split("\n"):
+            line = line.strip()
+            if line:
+                preview = line[:100]
+                if len(line) > 100:
+                    preview += "..."
+                break
+
+    console.print(f"    [{status_icon}]{duration} {preview}")
+
+    if not result.success and output:
+        # Show up to 3 lines of error detail
+        err_lines = [l.strip() for l in output.split("\n") if l.strip()][:3]
+        for el in err_lines[1:]:
+            console.print(f"    [dim red]{el[:120]}[/]")
+
+
 def _plain_message(message: str) -> None:
     """Simple stdout callback for non-TUI mode."""
     if message:
         for line in message.split("\n")[:5]:
             if line.strip():
-                console.print(f"[dim]> {line[:150]}[/]")
+                console.print(f"  [dim]| {line[:150]}[/]")
 
 
 def _print_plain_summary(status: dict) -> None:

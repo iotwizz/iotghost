@@ -9,6 +9,7 @@ state transitions, retry logic, and coordination between modules.
 from __future__ import annotations
 
 import logging
+import subprocess
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -456,13 +457,65 @@ class EmulationPipeline:
 
         # Create rootfs disk image for QEMU
         image_path = str(Path(self.state.workdir) / "rootfs.img")
-        self.state.rootfs_image = create_rootfs_image(
-            self.state.rootfs_path,
-            image_path,
-            size_mb=256,
-        )
+        try:
+            self.state.rootfs_image = create_rootfs_image(
+                self.state.rootfs_path,
+                image_path,
+                size_mb=256,
+            )
+        except subprocess.CalledProcessError as exc:
+            cmd_str = " ".join(str(a) for a in (exc.cmd or []))
+            stderr = (exc.stderr or b"").decode(errors="replace")[:300]
+            raise RuntimeError(
+                f"Failed to create rootfs image (exit {exc.returncode}).\n"
+                f"Command: {cmd_str}\n"
+                f"Stderr: {stderr}\n\n"
+                "Fix: install genext2fs (apt install genext2fs) or run with sudo.\n"
+                "If you don't need network TAP mode, try: --network user"
+            ) from exc
+        except PermissionError as exc:
+            raise RuntimeError(
+                f"Permission denied creating rootfs image: {exc}\n\n"
+                "Fix: install genext2fs (apt install genext2fs) or run with sudo."
+            ) from exc
 
         logger.info("Preparation complete: image=%s", self.state.rootfs_image)
+
+    @staticmethod
+    def _detect_arch_from_rootfs(rootfs_path: str) -> str:
+        """Fallback architecture detection by running 'file' on rootfs binaries."""
+        arch_keywords = {
+            "MIPS": "mipsel",
+            "MIPS, MIPS-I": "mips",
+            "MIPS, MIPS32": "mipsel",
+            "ARM,": "arm",
+            "ARM aarch64": "aarch64",
+            "x86-64": "x86_64",
+            "Intel 80386": "i386",
+            "PowerPC": "ppc",
+        }
+        # Check common binaries in rootfs
+        candidates = ["bin/busybox", "bin/sh", "sbin/init", "lib/libc.so.0"]
+        rootfs = Path(rootfs_path)
+        for candidate in candidates:
+            target = rootfs / candidate
+            if target.exists():
+                try:
+                    result = subprocess.run(
+                        ["file", str(target)],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    output = result.stdout
+                    for keyword, arch in arch_keywords.items():
+                        if keyword in output:
+                            logger.info(
+                                "Fallback arch detection: found '%s' in %s -> %s",
+                                keyword, candidate, arch,
+                            )
+                            return arch
+                except (subprocess.SubprocessError, OSError):
+                    continue
+        return "unknown"
 
     def _run_emulate_loop(self) -> None:
         """Phase 4+5: Emulate with fix loop.
@@ -471,6 +524,22 @@ class EmulationPipeline:
         to diagnose and repair, then retries. Loops up to max_fix_attempts.
         """
         self._set_phase(PipelinePhase.EMULATE)
+
+        # --- Guard: architecture must be known ---
+        arch = self.state.architecture
+        if not arch or arch == "unknown":
+            # Try fallback detection from rootfs binaries
+            rootfs = self.state.rootfs_path
+            if rootfs:
+                arch = self._detect_arch_from_rootfs(rootfs)
+                self.state.architecture = arch
+
+        if not arch or arch == "unknown":
+            raise RuntimeError(
+                "Cannot emulate: firmware architecture is 'unknown'.\n"
+                "The analysis phase failed to detect CPU architecture.\n"
+                "Please specify it manually with --arch (e.g. --arch mipsel)"
+            )
 
         # Build QEMU configuration
         qemu_config = QemuConfig(
@@ -484,16 +553,25 @@ class EmulationPipeline:
         qemu_config.apply_arch_defaults()
         self.state.qemu_config = qemu_config
 
-        # Setup network
+        # Setup network (only for tap mode; user mode needs no host setup)
         if self.config.network_mode == "tap":
-            host_iface = detect_host_interface() or "eth0"
-            net_config = NetworkConfig(
-                device_ip=self.config.device_ip,
-                nat_interface=host_iface,
-                qemu_mode="tap",
-            )
-            self.network = NetworkManager(net_config)
-            self.network.setup()
+            try:
+                host_iface = detect_host_interface() or "eth0"
+                net_config = NetworkConfig(
+                    device_ip=self.config.device_ip,
+                    nat_interface=host_iface,
+                    qemu_mode="tap",
+                )
+                self.network = NetworkManager(net_config)
+                self.network.setup()
+            except (subprocess.CalledProcessError, PermissionError, OSError) as exc:
+                logger.warning(
+                    "TAP network setup failed (%s), falling back to user mode", exc
+                )
+                qemu_config.network_mode = "user"
+                self.network = None
+        else:
+            logger.info("Using QEMU user-mode networking (no host setup needed)")
 
         while self.state.fix_attempts <= self.config.max_fix_attempts:
             # Launch QEMU

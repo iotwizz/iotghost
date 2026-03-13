@@ -229,6 +229,14 @@ Rootfs: {rootfs_path} | Arch: {architecture} | Needs NVRAM: {needs_nvram}
 
 Prepare the rootfs for emulation:
 
+CRITICAL: All filesystem operations MUST be idempotent (safe to re-run):
+- Always use 'mkdir -p' (never 'mkdir')
+- Always use 'cp -f' or 'cp -af' (never bare 'cp')
+- Always use 'ln -sf' (never 'ln -s' or 'ln')
+- Always use 'mknod' only after checking 'test -e <path>' first
+- Never assume a directory is empty -- the rootfs comes from extraction
+  and already has a full filesystem tree (bin, etc, lib, sbin, usr, var)
+
 1. NVRAM Setup (if needed):
    - Copy libnvram.so to {rootfs_path}/usr/lib/
    - Create /etc/nvram.ini with required key-value pairs
@@ -260,6 +268,10 @@ EMULATE_PROMPT = """\
 ## CURRENT PHASE: EMULATION
 
 Launch QEMU and get the firmware booting.
+
+CRITICAL: If you need to modify files in the rootfs, use idempotent commands:
+- 'mkdir -p' not 'mkdir', 'cp -f' not 'cp', 'ln -sf' not 'ln -s'
+- The rootfs already has a full directory tree from extraction.
 
 Configuration:
 - QEMU binary: {qemu_binary}

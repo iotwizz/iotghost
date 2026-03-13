@@ -125,6 +125,8 @@ class EmulationPipeline:
         config: PipelineConfig,
         on_phase_change: Callable[[PipelinePhase, PipelinePhase], None] | None = None,
         on_agent_message: Callable[[str], None] | None = None,
+        on_tool_call: Callable | None = None,
+        on_tool_result: Callable | None = None,
         on_status_update: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.config = config
@@ -133,6 +135,8 @@ class EmulationPipeline:
         # Callbacks for TUI integration
         self._on_phase_change = on_phase_change
         self._on_agent_message = on_agent_message
+        self._on_tool_call = on_tool_call
+        self._on_tool_result = on_tool_result
         self._on_status_update = on_status_update
 
         # Components (initialized during setup)
@@ -180,7 +184,7 @@ class EmulationPipeline:
         # Register shell tools
         register_all_tools()
 
-        # Initialize AI agent
+        # Initialize AI agent with all callbacks
         self.agent = ShellAgent(
             config=self.config.agent_config,
             on_message=lambda msg: (
@@ -188,6 +192,8 @@ class EmulationPipeline:
                 if self._on_agent_message and msg.content
                 else None
             ),
+            on_tool_call=self._on_tool_call or None,
+            on_tool_result=self._on_tool_result or None,
         )
         self.agent.initialize(SYSTEM_PROMPT)
 
@@ -214,7 +220,12 @@ class EmulationPipeline:
             self.state.final_status = "interrupted"
         except Exception as exc:
             logger.error("Pipeline error: %s", exc, exc_info=True)
-            self.state.final_status = f"error: {type(exc).__name__}: {exc}"
+            # Truncate status to avoid dumping LLM output into the summary
+            err_msg = str(exc)
+            if len(err_msg) > 200:
+                err_msg = err_msg[:200] + "..."
+            self.state.final_status = f"error: {type(exc).__name__}: {err_msg}"
+            self.state.last_error = err_msg
             self._set_phase(PipelinePhase.FAILED)
         finally:
             self._cleanup()
@@ -297,29 +308,63 @@ class EmulationPipeline:
                     )
                     rootfs = None
 
-            # 2. Search the workdir ourselves
+            # 2. Search multiple locations -- binwalk extracts relative to
+            #    CWD or firmware parent, not necessarily our workdir.
+            search_dirs = [
+                self.state.workdir,
+                str(Path(self.state.firmware_path).parent),
+                self.state.firmware_path + ".extracted",
+            ]
+            # Also check <workdir>/<firmware_stem>.extracted
+            fw_stem = Path(self.state.firmware_path).name
+            search_dirs.append(
+                str(Path(self.state.workdir) / (fw_stem + ".extracted"))
+            )
+            # And binwalk's _<name>.extracted pattern
+            search_dirs.append(
+                str(Path(self.state.workdir) / f"_{fw_stem}.extracted")
+            )
+
             if not rootfs:
-                rootfs = find_rootfs(self.state.workdir)
+                for search_dir in search_dirs:
+                    if Path(search_dir).is_dir():
+                        rootfs = find_rootfs(search_dir)
+                        if rootfs:
+                            logger.info(
+                                "Found rootfs via expanded search in %s",
+                                search_dir,
+                            )
+                            break
 
             if rootfs:
                 break
 
+            searched_str = ", ".join(
+                d for d in search_dirs if Path(d).is_dir()
+            )
             logger.warning(
-                "Extraction attempt %d/%d: no valid rootfs found, retrying",
-                attempt + 1, max_extract_retries,
+                "Extraction attempt %d/%d: no valid rootfs found in [%s], retrying",
+                attempt + 1, max_extract_retries, searched_str,
             )
             # Feed the failure back so the agent knows it failed
             self.agent.inject_context(
                 "[SYSTEM] The previous extraction attempt FAILED -- no directory "
                 "containing /bin, /etc, /lib, /sbin was found on disk. "
+                f"Searched: {searched_str}. "
                 "Your summary was incorrect. Try the next strategy."
             )
 
         if not rootfs:
+            searched_str = ", ".join(
+                d for d in [
+                    self.state.workdir,
+                    str(Path(self.state.firmware_path).parent),
+                ] if Path(d).is_dir()
+            )
             raise RuntimeError(
                 f"Extraction failed after {max_extract_retries} attempts: "
-                "could not locate root filesystem on disk. "
-                f"Last agent output: {last_agent_output[:500]}"
+                "could not locate root filesystem. "
+                f"Searched: [{searched_str}]"
             )
 
         self.state.rootfs_path = rootfs

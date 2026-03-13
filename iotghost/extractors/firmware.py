@@ -270,8 +270,14 @@ def get_extraction_commands(
 def find_rootfs(extraction_dir: str) -> str | None:
     """Search extracted files for the root filesystem directory.
 
-    Looks for directories containing typical rootfs markers:
-    /bin, /etc, /lib, /sbin, /usr, etc.
+    Handles common extraction layouts including:
+    - Direct rootfs in extraction dir
+    - binwalk _*.extracted/ offset directories (e.g. _40000.extracted/)
+    - TRX/ASUS nested layouts with multiple extraction layers
+    - squashfs-root/ and similar named directories
+    - Recursive matryoshka extraction trees
+
+    Returns the path to the best rootfs candidate, or None.
     """
     extraction_path = Path(extraction_dir)
     if not extraction_path.exists():
@@ -280,30 +286,103 @@ def find_rootfs(extraction_dir: str) -> str | None:
     rootfs_markers = {"bin", "etc", "lib", "sbin"}
     strong_markers = {"usr", "var", "tmp", "dev", "proc"}
 
-    # Search up to 4 levels deep
-    for depth in range(5):
+    # Collect all candidates with their scores for ranked selection
+    candidates: list[tuple[int, int, str]] = []  # (strong_count, -depth, path)
+
+    # --- Strategy 1: Check well-known directory names first (fast path) ---
+    well_known = [
+        "squashfs-root", "rootfs", "rootfs-root",
+        "cpio-root", "jffs2-root", "ubi-root",
+        "yaffs2-root", "ext-root",
+    ]
+    for name in well_known:
+        for match in extraction_path.rglob(name):
+            if not match.is_dir():
+                continue
+            children = {c.name for c in match.iterdir() if c.is_dir()}
+            if rootfs_markers.issubset(children):
+                strong_count = len(strong_markers & children)
+                depth = len(match.relative_to(extraction_path).parts)
+                candidates.append((strong_count, -depth, str(match)))
+                logger.debug("rootfs candidate (well-known): %s score=%d", match, strong_count)
+
+    # --- Strategy 2: Scan binwalk offset directories ---
+    # binwalk creates dirs like _firmware.bin.extracted/ containing
+    # offset-named subdirs (e.g., 40000/) or further _*.extracted/ trees
+    for extracted_dir in extraction_path.rglob("*extracted*"):
+        if not extracted_dir.is_dir():
+            continue
+        # Check the extracted dir itself
+        children = {c.name for c in extracted_dir.iterdir() if c.is_dir()}
+        if rootfs_markers.issubset(children):
+            strong_count = len(strong_markers & children)
+            depth = len(extracted_dir.relative_to(extraction_path).parts)
+            candidates.append((strong_count, -depth, str(extracted_dir)))
+
+        # Check immediate subdirs (offset dirs like 40000/, squashfs-root/, etc.)
+        for sub in extracted_dir.iterdir():
+            if not sub.is_dir():
+                continue
+            sub_children = {c.name for c in sub.iterdir() if c.is_dir()}
+            if rootfs_markers.issubset(sub_children):
+                strong_count = len(strong_markers & sub_children)
+                depth = len(sub.relative_to(extraction_path).parts)
+                candidates.append((strong_count, -depth, str(sub)))
+                logger.debug("rootfs candidate (offset-dir): %s score=%d", sub, strong_count)
+
+    # --- Strategy 3: Breadth-first scan up to 6 levels deep ---
+    # Walk level by level so shallower matches rank higher
+    for depth_limit in range(7):
         for candidate in extraction_path.rglob("*"):
             if not candidate.is_dir():
                 continue
+            rel_depth = len(candidate.relative_to(extraction_path).parts)
+            if rel_depth != depth_limit:
+                continue
 
-            children = {c.name for c in candidate.iterdir() if c.is_dir()}
-            # Must have all basic markers
+            try:
+                children = {c.name for c in candidate.iterdir() if c.is_dir()}
+            except PermissionError:
+                continue
+
             if rootfs_markers.issubset(children):
-                # Prefer candidates with more strong markers
                 strong_count = len(strong_markers & children)
-                if strong_count >= 2:
-                    logger.info("Found rootfs at: %s (score=%d)", candidate, strong_count)
-                    return str(candidate)
+                candidates.append((strong_count, -rel_depth, str(candidate)))
 
-    # Fallback: less strict matching
+    # --- Select best candidate ---
+    if candidates:
+        # Sort by: most strong markers first, then shallowest depth
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best_score, best_neg_depth, best_path = candidates[0]
+        if best_score >= 2:
+            logger.info(
+                "Found rootfs at: %s (score=%d, depth=%d, candidates=%d)",
+                best_path, best_score, -best_neg_depth, len(candidates),
+            )
+            return best_path
+
+    # --- Fallback: relaxed matching (3 of 4 core markers) ---
+    relaxed: list[tuple[int, int, str]] = []
     for candidate in extraction_path.rglob("*"):
         if not candidate.is_dir():
             continue
-        children = {c.name for c in candidate.iterdir() if c.is_dir()}
-        if len(rootfs_markers & children) >= 3:
-            logger.info("Found rootfs (relaxed) at: %s", candidate)
-            return str(candidate)
+        try:
+            children = {c.name for c in candidate.iterdir() if c.is_dir()}
+        except PermissionError:
+            continue
+        core_count = len(rootfs_markers & children)
+        if core_count >= 3:
+            strong_count = len(strong_markers & children)
+            rel_depth = len(candidate.relative_to(extraction_path).parts)
+            relaxed.append((core_count + strong_count, -rel_depth, str(candidate)))
 
+    if relaxed:
+        relaxed.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        _, _, best_path = relaxed[0]
+        logger.info("Found rootfs (relaxed) at: %s", best_path)
+        return best_path
+
+    logger.warning("No rootfs found in %s", extraction_dir)
     return None
 
 

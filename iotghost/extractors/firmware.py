@@ -308,8 +308,32 @@ def find_rootfs(extraction_dir: str) -> str | None:
 
     # --- Strategy 2: Scan binwalk offset directories ---
     # binwalk creates dirs like _firmware.bin.extracted/ containing
-    # offset-named subdirs (e.g., 40000/) or further _*.extracted/ trees
+    # offset-named subdirs (e.g., 40000/) or further _*.extracted/ trees.
+    # Newer binwalk versions also create bin-N-extracted/ directories.
     for extracted_dir in extraction_path.rglob("*extracted*"):
+        if not extracted_dir.is_dir():
+            continue
+        # Check the extracted dir itself
+        children = {c.name for c in extracted_dir.iterdir() if c.is_dir()}
+        if rootfs_markers.issubset(children):
+            strong_count = len(strong_markers & children)
+            depth = len(extracted_dir.relative_to(extraction_path).parts)
+            candidates.append((strong_count, -depth, str(extracted_dir)))
+
+        # Check immediate subdirs (offset dirs like 40000/, squashfs-root/, etc.)
+        for sub in extracted_dir.iterdir():
+            if not sub.is_dir():
+                continue
+            sub_children = {c.name for c in sub.iterdir() if c.is_dir()}
+            if rootfs_markers.issubset(sub_children):
+                strong_count = len(strong_markers & sub_children)
+                depth = len(sub.relative_to(extraction_path).parts)
+                candidates.append((strong_count, -depth, str(sub)))
+                logger.debug("rootfs candidate (offset-dir): %s score=%d", sub, strong_count)
+
+    # --- Strategy 2b: Scan binwalk v3 bin-N-extracted directories ---
+    # binwalk v3+ uses naming like bin-0-extracted/, bin-1-extracted/
+    for extracted_dir in extraction_path.rglob("bin-*-extracted"):
         if not extracted_dir.is_dir():
             continue
         # Check the extracted dir itself
@@ -354,12 +378,13 @@ def find_rootfs(extraction_dir: str) -> str | None:
         # Sort by: most strong markers first, then shallowest depth
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
         best_score, best_neg_depth, best_path = candidates[0]
-        if best_score >= 2:
-            logger.info(
-                "Found rootfs at: %s (score=%d, depth=%d, candidates=%d)",
-                best_path, best_score, -best_neg_depth, len(candidates),
-            )
-            return best_path
+        # Any directory with all 4 core markers (bin, etc, lib, sbin) is a
+        # valid rootfs.  Strong markers are a ranking tiebreaker, not a gate.
+        logger.info(
+            "Found rootfs at: %s (score=%d, depth=%d, candidates=%d)",
+            best_path, best_score, -best_neg_depth, len(candidates),
+        )
+        return best_path
 
     # --- Fallback: relaxed matching (3 of 4 core markers) ---
     relaxed: list[tuple[int, int, str]] = []

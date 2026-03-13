@@ -491,7 +491,7 @@ def create_rootfs_image(
             check=True, capture_output=True,
         )
         subprocess.run(
-            ["cp", "-a", f"{rootfs_dir}/.", mount_point],
+            ["cp", "-af", f"{rootfs_dir}/.", mount_point],
             check=True, capture_output=True,
         )
     finally:

@@ -373,13 +373,16 @@ class EmulationPipeline:
 
         # Deploy NVRAM if needed
         if self.state.needs_nvram and self.state.nvram_config:
-            actions = deploy_nvram(
-                self.state.rootfs_path,
-                self.state.nvram_config,
-                device_ip=self.config.device_ip,
-            )
-            for action in actions:
-                logger.info("NVRAM: %s", action)
+            try:
+                actions = deploy_nvram(
+                    self.state.rootfs_path,
+                    self.state.nvram_config,
+                    device_ip=self.config.device_ip,
+                )
+                for action in actions:
+                    logger.info("NVRAM: %s", action)
+            except FileExistsError as exc:
+                logger.warning("NVRAM deploy hit existing path (%s), continuing", exc)
 
         # Let agent do additional preparation
         prompt = PREPARE_PROMPT.format(
@@ -388,7 +391,23 @@ class EmulationPipeline:
             needs_nvram=self.state.needs_nvram,
         )
         self.agent.inject_context(prompt)
-        self.agent.run_until_done(max_iterations=15)
+
+        try:
+            self.agent.run_until_done(max_iterations=15)
+        except FileExistsError as exc:
+            # Agent's shell commands may trigger FileExistsError via
+            # Python shutil/pathlib calls.  Inject recovery guidance
+            # and let the agent try once more with idempotent commands.
+            logger.warning("Prepare phase hit FileExistsError: %s -- retrying", exc)
+            recovery = (
+                f"[SYSTEM] A FileExistsError occurred: {exc}\n"
+                "The target path already exists from the firmware extraction.\n"
+                "Resume preparation using ONLY idempotent commands:\n"
+                "  mkdir -p, cp -af, ln -sf, mknod only after 'test -e'.\n"
+                "Do NOT re-create directories that already exist."
+            )
+            self.agent.inject_context(recovery)
+            self.agent.run_until_done(max_iterations=10)
 
         # Create rootfs disk image for QEMU
         image_path = str(Path(self.state.workdir) / "rootfs.img")

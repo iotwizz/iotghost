@@ -140,6 +140,10 @@ def main() -> None:
     help="LLM temperature (lower = more deterministic).",
     show_default=True,
 )
+@click.option(
+    "--nollama", "--no-ollama", is_flag=True, default=False,
+    help="Skip local Ollama -- use --base-url for a remote/cloud LLM endpoint.",
+)
 def run(
     firmware: str,
     provider: str,
@@ -157,6 +161,7 @@ def run(
     debug: bool,
     no_tui: bool,
     temperature: float,
+    nollama: bool,
 ) -> None:
     """Emulate an IoT firmware image using AI-driven QEMU emulation.
 
@@ -176,6 +181,18 @@ def run(
     # Print banner
     if not no_tui:
         _print_banner(firmware, model, arch, network)
+
+    # When --nollama is set, treat the provider as a generic OpenAI-compatible
+    # endpoint (no Ollama health check).  The user must supply --base-url and
+    # --model pointing at their remote/cloud LLM.
+    if nollama:
+        provider = "openai_compatible"
+        if base_url == "http://localhost:11434":
+            console.print(
+                "[bold yellow]Warning:[/] --nollama used but --base-url is still "
+                "the default Ollama URL.  Pass --base-url <your-endpoint> to "
+                "point at your cloud LLM."
+            )
 
     # Build configuration
     agent_config = AgentConfig(
@@ -206,12 +223,13 @@ def run(
         tui = EmulationTUI(verbose=verbose)
 
     # Build pipeline with callbacks
+    # Use getattr for tool callbacks in case TUI class hasn't been updated yet
     pipeline = EmulationPipeline(
         config=pipeline_config,
         on_phase_change=tui.on_phase_change if tui else _plain_phase_change,
         on_agent_message=tui.on_agent_message if tui else _plain_message,
-        on_tool_call=tui.on_tool_call if tui else _plain_tool_call,
-        on_tool_result=tui.on_tool_result if tui else _plain_tool_result,
+        on_tool_call=getattr(tui, "on_tool_call", _plain_tool_call) if tui else _plain_tool_call,
+        on_tool_result=getattr(tui, "on_tool_result", _plain_tool_result) if tui else _plain_tool_result,
         on_status_update=tui.on_status_update if tui else None,
     )
 
